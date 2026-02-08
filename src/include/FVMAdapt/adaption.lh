@@ -1,0 +1,95 @@
+//#############################################################################
+//#
+//# Copyright 2008-2025, Mississippi State University
+//#
+//# This file is part of the Loci Framework.
+//#
+//# The Loci Framework is free software: you can redistribute it and/or modify
+//# it under the terms of the Lesser GNU General Public License as published by
+//# the Free Software Foundation, either version 3 of the License, or
+//# (at your option) any later version.
+//#
+//# The Loci Framework is distributed in the hope that it will be useful,
+//# but WITHOUT ANY WARRANTY; without even the implied warranty of
+//# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//# Lesser GNU General Public License for more details.
+//#
+//# You should have received a copy of the Lesser GNU General Public License
+//# along with the Loci Framework.  If not, see <http://www.gnu.org/licenses>
+//#
+//#############################################################################
+
+//--------------------------------------------------------------------------
+// Vars file variables for mesh adaptation
+
+/// Vars variable for controlling adaptation mode. Can be 'isotropic',
+/// 'anisotropic', or '2D'
+$type adaptMode param<string> ;
+
+/// Minimum edge length allowed for refinement
+$type adaptMinEdgeLength param<double> ;
+
+/// Face folding criterion to disable refining highly twisted faces
+$type adaptFaceFold param<double> ;
+
+/// Flag to select mesh balancing method used to balance refinement
+/// levels
+$type adaptBalanceType param<int> ;
+
+/// How frequently in solver iterations before mesh adaptation will be
+/// evaluated
+$type adaptFrequency param<int> ;
+
+/// Vars variable for controlling when refinement starts. Refinement does not
+// start until this timestep is reached.
+$type adaptStart param<int> ;
+
+/// Error threshold for refinement
+$type adaptSensitivity param<double> ;
+
+/// Error threshold for de-refinement
+$type coarsenSensitivity param<double> ;
+
+/// Maximum number of adaption steps to perform.
+$type maxAdaptSteps param<int> ;
+
+/// Maximum number of cells in adaption phase (in millions of cells).
+/// Fractional values are allowed. A negative value disables this limit.
+$type maxAdaptCellCount param<double> ;
+
+/// Comma separated list of sensor names to use for adaptation.
+$type adaptSensor param<list_input>  ;
+
+//----------------------------------------------------------------------------
+// Module-specific variables
+
+/// Boolean for controlling when adaptation is performed. This is set by the
+/// solver.
+$type do_adapt param<bool> ;
+
+/// Constraints for adaption mode.
+$type adaptMode2D Constraint ;
+$type adaptMode3D Constraint ;
+
+/// Parametric variable cell_error_s stores the maximum value of the absolute
+/// value difference between two scalar face variables, X and Y, between all
+/// adjacent cells.
+$type cell_error_s(X,Y) store<real> ;
+
+/// Parametric variable cell_error_s stores the maximum value of the absolute
+/// value difference between two vector face variables, X and Y, over all
+/// faces.
+$type cell_error_v3d(V,W) store<real> ;
+
+
+//------ Options for geometry-based adaptation ------
+
+/// Controls the target edge length for overset geometry refinement
+$type adaptGeometryEdgeLength param<double> ;
+
+/// Controls the thickness of de-refinement levels for overset geometry
+/// refinement
+$type adaptGeometryLayers param<double> ;
+
+//----------------------------------------------------
+
