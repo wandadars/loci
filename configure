@@ -1061,6 +1061,8 @@ echo "install_minimal:"                      >> Makefile
 echo "	@\$(MAKE) -C ${OBJDIR} \$@"          >> Makefile
 echo "test:"                                 >> Makefile
 echo "	@\$(MAKE) -C ${OBJDIR} \$@"          >> Makefile
+echo "api-docs:"                             >> Makefile
+echo "	@\$(MAKE) -C ${OBJDIR} \$@"          >> Makefile
 echo "docs:"                                 >> Makefile
 echo "	@\$(MAKE) -C ${OBJDIR} \$@"          >> Makefile
 echo "clean:"                                >> Makefile

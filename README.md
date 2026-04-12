@@ -193,6 +193,7 @@ The following make commands are provided after successfully executing `./configu
 | `make install_minimal`        | Minimal compile and install Loci sans pdf documentation      |
 | `make uninstall`              | Undo the install (remove Loci from the install directory)    |
 | `make test`                   | Run unit and regression tests                                |
+| `make api-docs`               | Generate experimental Doxygen HTML for the C++ source tree   |
 | `make docs`                   | Compile latex documentation to PDF files                     |
 | `make clean`                  | Clean compiled files from OBJ directory                      |
 | `make distclean`              | Remove all configuration and compilation artifacts           |

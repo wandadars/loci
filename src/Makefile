@@ -20,6 +20,9 @@
 ###############################################################################
 #
 LOCI_BASE = $(shell pwd)
+LOCI_MAKEFILE = $(realpath $(firstword $(MAKEFILE_LIST)))
+LOCI_SRC_DIR = $(dir $(LOCI_MAKEFILE))
+LOCI_ROOT_DIR = $(abspath $(LOCI_SRC_DIR)/..)
 LOCI_COMPILE = true
 include Loci.conf
 include version.conf
@@ -27,7 +30,7 @@ include version.conf
 
 DEFINES = $(DEBUG) $(SYSTEM_DEFINES) $(MACHINE_SPECIFIC)
 
-.PHONEY: default library docs install lpp FVMtools FVMMod FVMAdapt FVMOverset
+.PHONEY: default library docs api-docs install lpp FVMtools FVMMod FVMAdapt FVMOverset
 .PHONEY: METIS SPRNG
 default: library lpp FVMtools FVMMod FVMAdapt FVMOverset METIS SPRNG
 
@@ -35,6 +38,9 @@ library: Tools/libTools.$(LIB_SUFFIX) System/libLoci.$(LIB_SUFFIX)
 
 docs:
 	$(MAKE) -C Tutorial/docs LOCI_BASE="$(LOCI_BASE)"
+
+api-docs: include/Config/version_info.h include/Config/version_details.h
+	$(MAKE) -C $(LOCI_ROOT_DIR)/docs LOCI_ROOT_DIR="$(LOCI_ROOT_DIR)" OBJDIR="$(LOCI_BASE)" doxygen
 
 install: default docs
 	INSTALL_DIR=$(INSTALL_DIR) LOCI_INSTALL_DIR=$(LOCI_INSTALL_DIR) \
