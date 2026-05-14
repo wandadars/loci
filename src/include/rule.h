@@ -49,19 +49,74 @@
 #include <DMultiStore.h>
 
 namespace Loci {
-  
+
   class fact_db ;
   class sched_db ;
-  
+
+  /// @brief Abstract interface for the runtime join operation used by
+  ///   reduction-style `apply_rule`s.
+  ///
+  /// When a variable is computed through a unit/apply reduction pattern, the
+  /// contributing `apply_rule` provides a `joiner` that knows how to merge a
+  /// source value into the target store representation. Execution code uses
+  /// this interface to clone the operation, allocate a compatible target
+  /// representation, bind source and target stores, and perform the join over
+  /// a sequence of entities, optionally through a map from target entities to
+  /// source entities.
   class joiner : public CPTR_type {
   public:
+    /// @brief Creates an unbound copy of this join operation.
+    ///
+    /// The clone preserves the concrete join behavior, but callers are
+    /// expected to bind it to specific source and target store
+    /// representations with `SetArgs()` before calling `Join()`.
+    ///
+    /// @return A fresh `joiner` of the same concrete type.
     virtual CPTR<joiner> clone() = 0 ;
+
+    /// @brief Returns a prototype store representation for the join target.
+    ///
+    /// Callers use this to obtain a store representation compatible with the
+    /// reduction target, either to inspect its kind or to allocate and unpack
+    /// temporary values before binding the joiner. The returned representation
+    /// is not yet bound to live rule data.
+    ///
+    /// @return A target-compatible `storeRepP`, or `0` when the joiner does
+    ///   not expose a concrete target representation.
     virtual storeRepP getTargetRep() = 0 ;
+
+    /// @brief Binds the joiner to the target and source store representations
+    ///   used by the next join.
+    ///
+    /// The first argument is the store that will be updated, and the second is
+    /// the store whose values will be merged into it.
+    ///
+    /// @param[in] target Store representation that receives the joined values.
+    /// @param[in] source Store representation that provides the incoming
+    ///   values.
     virtual void SetArgs(storeRepP &target, storeRepP &source) = 0 ;
+
+    /// @brief Applies the join over entities that use the same indexing in the
+    ///   source and target stores.
+    ///
+    /// After `SetArgs()`, this joins the source value into the target value
+    /// for each entity named in `seq`.
+    ///
+    /// @param[in] seq Entity sequence to join.
     virtual void Join(const sequence &seq) = 0 ;
+
+    /// @brief Applies the join over entities whose source and target indices
+    ///   are related by a map.
+    ///
+    /// After `SetArgs()`, this joins each target entity in `seq` with the
+    /// source entity selected by `t2s`. For joiners whose concrete storage
+    /// does not require per-entity remapping, the map may be ignored.
+    ///
+    /// @param[in] t2s Map from target entities to source entities.
+    /// @param[in] seq Target-side entity sequence to join.
     virtual void Join(Map &t2s, const sequence &seq) = 0 ;
-  } ;  
-  
+  } ;
+
   class rule;
   class rule_impl : public CPTR_type {
   public:
@@ -93,19 +148,26 @@ namespace Loci {
     const char **vardoc ;
     void source(const std::string &invar) ;
     void target(const std::string &outvar) ;
-    std::string rule_comments ; // the comments for a rule_impl
+
+    /// The comments for a rule_impl
+    std::string rule_comments ;
+
+    /// Source location where this rule is defined.
     std::string fileloc ;
-    // keyspace tag that dictates which keyspace the rule
-    // is currently assigned to, defaults to empty string,
-    // which currently means that the rule should be scheduled
-    // under the default "metis" key space.
+
+    /// Keyspace tag assigned to this rule.
+    /// The constructor initializes this to `"main"`, which is the default
+    /// keyspace used when no more specific tag is assigned.
     std::string space_tag ;
-    // bit indicates whether keyspace (the one this rule is in)
-    // distribution should be considered after this rule's execution
+
+    /// Bit indicates whether keyspace (the one this rule is in)
+    /// distribution should be considered after this rule's execution
     bool space_dist ;
-    // these flags record whether the rule has pre- and postlude methods
-    // defaults would be false for both
+
+    /// Flag to record whether the rule has prelude methods, defaults to false.
     bool use_prelude;
+
+    /// Flag to record whether the rule has postlude methods, defaults to false.
     bool use_postlude;
   protected:
     rule_impl(rule_impl &f) { fatal(true) ; }
@@ -159,88 +221,96 @@ namespace Loci {
     bool is_relaxed() const { return relaxed_recursion ; }
     bool is_specialized() { return specialized_parametric; }
     bool is_parametric_provided() { return use_parametric_variable ; }
-    // check if pre- and postlude methods are present
+
+    // Check if prelude methods are present
     bool has_prelude() const { return use_prelude; }
+
+    /// Check if postlude methods are present
     bool has_postlude() const { return use_postlude; }
     variable get_parametric_variable() { return ParametricVariable ; }
     void initialize(fact_db &facts) ;
-    // this method returns all the keyspaces involved in a rule
-    // that need to be considered for distribution
-    std::vector<std::string>
-    gather_keyspace_dist() const ;
-    // this method returns whether this rule affects keyspace
-    // distribution
-    bool
-    affect_keyspace_dist() const {return space_dist ;}
 
-    std::string
-    get_keyspace_tag() const {return space_tag ;}
-    
+    /// Return the keyspaces involved in a rule that need distribution handling.
+    std::vector<std::string> gather_keyspace_dist() const ;
+
+    /// Return whether this rule affects keyspace distribution.
+    bool affect_keyspace_dist() const { return space_dist ; }
+
+    /// Return the keyspace tag assigned to this rule.
+    std::string get_keyspace_tag() const { return space_tag ; }
     rule_impl_type get_rule_class() const { return rule_impl_class ; }
     const info &get_info() const { return rule_info ; }
     void set_store(variable v, const storeRepP &p) ;
-    void set_store(const std::string &nm, const storeRepP &p) 
-      { set_store(variable(expression::create(nm)),p) ; }
-    
+    void set_store(const std::string &nm, const storeRepP &p) {
+      set_store(variable(expression::create(nm)),p) ;
+    }
+
     storeRepP get_store(variable v) const ;
-    storeRepP get_store(const std::string &nm) const
-      { return get_store(variable(expression::create(nm))) ; }
-    
-    // This function checks to
-    // see if the rule contains constraints that are of type Map. In case
-    // of yes, it creates identical constraints
-    // (whose value equal the Map domain) in the fact_db and substitutes
-    // the Map constraints in the rule with the real constraints.
-    //
-    // The motivation of this function is that in the parallel code,
-    // a Map constraint will often not be expanded enough to include
-    // the clone region, thus causing problems in the rule execution
-    // schedule. Since the context of the rule including the clone region
-    // will often exceed the domain of the constraint, this will either
-    // cause the clone region not being computed properly, or in the case
-    // of unit/apply rule, cause conflicts in the existential analysis.
-    //
-    // We could expand the Maps used in rule contraints to include the
-    // clone region. However doing so would often require duplicating
-    // the Map on all processes, thus incurring a memory cost, or else,
-    // we would be allocating the Map on domains that do not have
-    // meaningful values for the Map.
-    //
-    // Thus, here we are doing a substitution to replace all Maps
-    // in rule constraint as real constraint variable. If substitution
-    // have happened, "facts" may include newly created constraints;
-    // the rules may have its "vmap_info" structure modified
-    // to reflect the substitution of constraints for maps.
+    storeRepP get_store(const std::string &nm) const {
+      return get_store(variable(expression::create(nm))) ;
+    }
+
+    /// @brief This function checks to see if the rule contains constraints
+    ///   that are of type `Map`.
+    ///
+    /// In case of yes, it creates identical constraints (whose value equal the
+    /// `Map` domain) in the `fact_db` and substitutes the `Map` constraints in
+    /// the rule with the real constraints.
+    ///
+    /// The motivation of this function is that in the parallel code, a `Map`
+    /// constraint will often not be expanded enough to include the clone
+    /// region, thus causing problems in the rule execution schedule. Since the
+    /// context of the rule including the clone region will often exceed the
+    /// domain of the constraint, this will either cause the clone region not
+    /// being computed properly, or in the case of unit/apply rule, cause
+    /// conflicts in the existential analysis.
+    ///
+    /// We could expand the `Map`s used in rule constraints to include the clone
+    /// region. However doing so would often require duplicating the `Map` on
+    /// all processes, thus incurring a memory cost, or else, we would be
+    /// allocating the `Map` on domains that do not have meaningful values for
+    /// the `Map`.
+    ///
+    /// Thus, here we are doing a substitution to replace all `Map`s in rule
+    /// constraint as real constraint variable. If substitution have happened,
+    /// `facts` may include newly created constraints; the rules may have its
+    /// `vmap_info` structure modified to reflect the substitution of
+    /// constraints for maps.
+    ///
+    /// @param[in,out] facts Fact database that may receive newly created
+    ///   constraints during the substitution.
     void replace_map_constraints(fact_db& facts) ;
 
     void set_variable_times(time_ident tl) ;
     void copy_store_from(rule_impl &f) ;
     void Print(std::ostream &s) const ;
-   
+
     void prot_rename_vars(std::map<variable, variable> &rvm) ;
     virtual void rename_vars(std::map<variable, variable>  &rvm) ;
     variableSet get_var_list() ;
 
     virtual rule_implP new_rule_impl() const ;
-    // the compute method handles the kernel computation
+
+    /// The compute method handles the kernel computation
     virtual void compute(const sequence &) = 0 ;
-    // the prelude method is intended to be used to setup
-    // global parameters (such as the vec size of a store)
-    // it is not required to define such method when creating
-    // a rule and the preprocessor might optimize away this
-    // method if a user does not define it in a rule
+
+    /// The prelude method is intended to be used to setup global parameters
+    /// (such as the vec size of a store). It is not required to define such
+    /// method when creating a rule and the preprocessor might optimize away
+    /// this method if a user does not define it in a rule
     virtual void prelude(const sequence&) {}
-    // the postlude is similarly defined as the prelude method
+
+    /// The postlude is similarly defined as the prelude method
     virtual void postlude(const sequence&) {}
     virtual CPTR<joiner> get_joiner() = 0 ;
     virtual rule_implP add_namespace(const std::string& n) const ;
     std::string get_comments() const {return rule_comments ;}
     std::string get_fileloc() const { return fileloc; }
   } ;
-  
+
   typedef rule_impl::rule_implP rule_implP ;
-  
-  
+
+
   template <class TCopyRuleImpl> class copy_rule_impl : public TCopyRuleImpl {
     typedef std::list<std::map<variable, variable> > rename_varList ;
     typedef std::list<std::map<variable, variable> >::const_iterator list_iter;
@@ -248,131 +318,162 @@ namespace Loci {
   public:
     virtual rule_implP new_rule_impl() const ;
     virtual void rename_vars(std::map<variable, variable> &rvm) ;
-  } ; 
-  
+  } ;
+
   template <class TCopyRuleImpl> rule_implP copy_rule_impl<TCopyRuleImpl>::new_rule_impl() const {
     rule_implP realrule_impl = new copy_rule_impl<TCopyRuleImpl> ;
-    for(list_iter li = rvlist.begin(); li != rvlist.end(); ++li) { 
+    for(list_iter li = rvlist.begin(); li != rvlist.end(); ++li) {
       std::map<variable, variable> rvm = *li;
       realrule_impl->rename_vars(rvm) ;
     }
     return realrule_impl ;
   }
 
-  template <class TCopyRuleImpl> 
+  template <class TCopyRuleImpl>
     void copy_rule_impl<TCopyRuleImpl>::rename_vars(std::map<variable,variable> &rvm) {
     rvlist.push_back(rvm) ;
     rule_impl::prot_rename_vars(rvm) ;
   }
 
 
-  // this is the new rule type for setting default
-  // values in the facts database. It should not have
-  // any inputs
+  /// This is the new rule type for setting default values in the facts
+  /// database. It should not have any inputs
   class default_rule: public rule_impl {
   protected:
     default_rule() { rule_class(DEFAULT) ; }
-    void name_store(const std::string &nm, store_instance &si)
-      { rule_impl::name_store(nm,si) ; }
+    void name_store(const std::string &nm, store_instance &si) {
+      rule_impl::name_store(nm,si) ;
+    }
     void input(const std::string &invar) {
       std::cerr << "Warning: a DEFAULT rule should not have any inputs!"
                 << endl ;
     }
-    void output(const std::string &outvar)
-    { rule_impl::output(outvar) ; }
-    void constraint(const std::string &constrain)
-    { rule_impl::constraint(constrain) ; }
-    void conditional(const std::string &cond)
-      { rule_impl::conditional(cond) ; }
+    void output(const std::string &outvar) {
+      rule_impl::output(outvar) ;
+    }
+    void constraint(const std::string &constrain) {
+      rule_impl::constraint(constrain) ;
+    }
+    void conditional(const std::string &cond) {
+      rule_impl::conditional(cond) ;
+    }
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   } ;
 
-  // this is the new rule type for setting optional
-  // values in the facts database. It should not have
-  // any inputs
+  /// This is the rule type for setting optional values in the facts database.
+  /// It should not have any inputs
   class optional_rule: public rule_impl {
   protected:
     optional_rule() { rule_class(OPTIONAL) ; }
-    void name_store(const std::string &nm, store_instance &si)
-      { rule_impl::name_store(nm,si) ; }
+    void name_store(const std::string &nm, store_instance &si) {
+      rule_impl::name_store(nm,si) ;
+    }
     void input(const std::string &invar) {
       std::cerr << "Warning: an OPTIONAL rule should not have any inputs!"
                 << endl ;
     }
-    void output(const std::string &outvar)
-    { rule_impl::output(outvar) ; }
-    void constraint(const std::string &constrain)
-    { rule_impl::constraint(constrain) ; }
-    void conditional(const std::string &cond)
-      { rule_impl::conditional(cond) ; }
+    void output(const std::string &outvar) {
+      rule_impl::output(outvar) ;
+    }
+    void constraint(const std::string &constrain) {
+      rule_impl::constraint(constrain) ;
+    }
+    void conditional(const std::string &cond) {
+      rule_impl::conditional(cond) ;
+    }
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   } ;
 
+  /// Rule type for computing `Constraint`-typed outputs at runtime.
+  ///
+  /// A `constraint_rule` is used to derive constraint facts from existing
+  /// inputs during execution. The resulting constraints may then be consumed
+  /// by later Loci rules.
   class constraint_rule: public rule_impl {
   protected:
     constraint_rule() { rule_class(CONSTRAINT_RULE) ; }
-    void name_store(const std::string &nm, store_instance &si)
-      { rule_impl::name_store(nm,si) ; }
-    void input(const std::string &invar)
-    { rule_impl::input(invar) ; }
-    void output(const std::string &outvar)
-    { rule_impl::output(outvar) ; }
+    void name_store(const std::string &nm, store_instance &si) {
+      rule_impl::name_store(nm,si) ;
+    }
+    void input(const std::string &invar) {
+      rule_impl::input(invar) ;
+    }
+    void output(const std::string &outvar) {
+      rule_impl::output(outvar) ;
+    }
     // do we allow constraint in a constraint rule???
     // I don't think so currently --- so we disable it for now.
-    //     void constraint(const std::string &constrain)
-    //     { rule_impl::constraint(constrain) ; }
-    void conditional(const std::string &cond)
-      { rule_impl::conditional(cond) ; }
+    //     void constraint(const std::string &constrain) {
+    //       rule_impl::constraint(constrain) ;
+    //     }
+    void conditional(const std::string &cond) {
+      rule_impl::conditional(cond) ;
+    }
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   } ;
 
   class map_rule: public rule_impl {
   protected:
     map_rule() { rule_class(MAP_RULE) ; }
-    void name_store(const std::string& nm, store_instance& si)
-      {rule_impl::name_store(nm,si) ; }
-    void input(const std::string& invar)
-      {rule_impl::input(invar) ;}
-    void output(const std::string& outvar)
-      {rule_impl::output(outvar) ;}
-    void constraint(const std::string& constrain)
-      {rule_impl::constraint(constrain) ;}
-    void conditional(const std::string& cond)
-      {rule_impl::conditional(cond) ;}
-    virtual CPTR<joiner> get_joiner() {return CPTR<joiner>(0) ;}
-  } ;
-  
-  class blackbox_rule : public rule_impl {
-  protected:
-    blackbox_rule() { rule_class(BLACKBOX_RULE) ; disable_threading(); }
-    void name_store(const std::string &nm, store_instance &si)
-    { rule_impl::name_store(nm,si) ; }
-    void input(const std::string &invar)
-    { rule_impl::input(invar) ; }
-    void output(const std::string &outvar)
-    { rule_impl::output(outvar) ; }
-    void constraint(const std::string &constrain)
-    { rule_impl::constraint(constrain) ; }
-    void conditional(const std::string &cond)
-    { rule_impl::conditional(cond) ; }
+    void name_store(const std::string& nm, store_instance& si) {
+      rule_impl::name_store(nm,si) ;
+    }
+    void input(const std::string& invar) {
+      rule_impl::input(invar) ;
+    }
+    void output(const std::string& outvar) {
+      rule_impl::output(outvar) ;
+    }
+    void constraint(const std::string& constrain) {
+      rule_impl::constraint(constrain) ;
+    }
+    void conditional(const std::string& cond) {
+      rule_impl::conditional(cond) ;
+    }
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   } ;
 
-  
-  // This rule is 
+  class blackbox_rule : public rule_impl {
+  protected:
+    blackbox_rule() { rule_class(BLACKBOX_RULE) ; disable_threading() ; }
+    void name_store(const std::string &nm, store_instance &si) {
+      rule_impl::name_store(nm,si) ;
+    }
+    void input(const std::string &invar) {
+      rule_impl::input(invar) ;
+    }
+    void output(const std::string &outvar) {
+      rule_impl::output(outvar) ;
+    }
+    void constraint(const std::string &constrain) {
+      rule_impl::constraint(constrain) ;
+    }
+    void conditional(const std::string &cond) {
+      rule_impl::conditional(cond) ;
+    }
+    virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
+  } ;
+
+  /// Internal base class for special system rules whose scheduler behavior is
+  /// defined through custom existential and request-processing hooks.
   class super_rule : public rule_impl {
   protected:
     super_rule() { rule_class(SUPER_RULE) ; disable_threading(); }
-    void name_store(const std::string &nm, store_instance &si)
-    { rule_impl::name_store(nm,si) ; }
-    void input(const std::string &invar)
-    { rule_impl::input(invar) ; }
-    void output(const std::string &outvar)
-    { rule_impl::output(outvar) ; }
-    void constraint(const std::string &constrain)
-    { rule_impl::constraint(constrain) ; }
-    void conditional(const std::string &cond)
-    { rule_impl::conditional(cond) ; }
+    void name_store(const std::string &nm, store_instance &si) {
+      rule_impl::name_store(nm,si) ;
+    }
+    void input(const std::string &invar) {
+      rule_impl::input(invar) ;
+    }
+    void output(const std::string &outvar) {
+      rule_impl::output(outvar) ;
+    }
+    void constraint(const std::string &constrain) {
+      rule_impl::constraint(constrain) ;
+    }
+    void conditional(const std::string &cond) {
+      rule_impl::conditional(cond) ;
+    }
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   public:
     virtual void process_existential(rule r, fact_db &facts, sched_db &scheds) = 0 ;
@@ -382,141 +483,212 @@ namespace Loci {
   class pointwise_rule : public rule_impl {
   protected:
     pointwise_rule() { rule_class(POINTWISE) ; }
-    void name_store(const std::string &nm, store_instance &si)
-      { rule_impl::name_store(nm,si) ; }
-    void input(const std::string &invar)
-    { rule_impl::input(invar) ; }
-    void output(const std::string &outvar)
-    { rule_impl::output(outvar) ; }
-    void constraint(const std::string &constrain)
-    { rule_impl::constraint(constrain) ; }
-    void conditional(const std::string &cond)
-      { rule_impl::conditional(cond) ; }
+    void name_store(const std::string &nm, store_instance &si) {
+      rule_impl::name_store(nm,si) ;
+    }
+    void input(const std::string &invar) {
+      rule_impl::input(invar) ;
+    }
+    void output(const std::string &outvar) {
+      rule_impl::output(outvar) ;
+    }
+    void constraint(const std::string &constrain) {
+      rule_impl::constraint(constrain) ;
+    }
+    void conditional(const std::string &cond) {
+      rule_impl::conditional(cond) ;
+    }
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   } ;
 
   class singleton_rule : public rule_impl {
   protected:
     singleton_rule() { rule_class(SINGLETON) ; }
-    void name_store(const std::string &nm, store_instance &si)
-    { rule_impl::name_store(nm,si) ; }
-    void input(const std::string &invar)
-    { rule_impl::input(invar) ; }
-    void output(const std::string &outvar)
-    { rule_impl::output(outvar) ; }
-    void constraint(const std::string &constrain)
-    { rule_impl::constraint(constrain) ; }
-    void conditional(const std::string &cond)
-    { rule_impl::conditional(cond) ; }
+    void name_store(const std::string &nm, store_instance &si) {
+      rule_impl::name_store(nm,si) ;
+    }
+    void input(const std::string &invar) {
+      rule_impl::input(invar) ;
+    }
+    void output(const std::string &outvar) {
+      rule_impl::output(outvar) ;
+    }
+    void constraint(const std::string &constrain) {
+      rule_impl::constraint(constrain) ;
+    }
+    void conditional(const std::string &cond) {
+      rule_impl::conditional(cond) ;
+    }
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   } ;
-  
+
+  /// Base class for the initializing rule in a unit/apply reduction.
+  ///
+  /// A `unit_rule` seeds the reduction target with its unit value before the
+  /// corresponding `apply_rule` accumulates contributions into it.
   class unit_rule : public rule_impl {
    protected:
     unit_rule() { rule_class(UNIT) ; }
-    void name_store(const std::string &nm, store_instance &si)
-    { rule_impl::name_store(nm,si) ; }
-    void input(const std::string &invar)
-    { rule_impl::input(invar) ; }
-    void output(const std::string &outvar)
-    { rule_impl::output(outvar) ; }
-    void constraint(const std::string &constrain)
-    { rule_impl::constraint(constrain) ; }
-    void conditional(const std::string &cond)
-    { rule_impl::conditional(cond) ; }
+    void name_store(const std::string &nm, store_instance &si) {
+      rule_impl::name_store(nm,si) ;
+    }
+    void input(const std::string &invar) {
+      rule_impl::input(invar) ;
+    }
+    void output(const std::string &outvar) {
+      rule_impl::output(outvar) ;
+    }
+    void constraint(const std::string &constrain) {
+      rule_impl::constraint(constrain) ;
+    }
+    void conditional(const std::string &cond) {
+      rule_impl::conditional(cond) ;
+    }
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   } ;
 
+  /// Adapts a reduction operator `Op` to the runtime `joiner` interface.
+  ///
+  /// `apply_rule<T,Op>` uses this adapter so the same combine operation can be
+  /// reused when Loci merges partial results across threads, processors, or
+  /// mapped local-reduction targets.
   template <class T, class Op> class joinOp : public joiner {
+    /// Reduction operator used to merge source values into target values.
     Op join ;
+
+    /// Typed views bound to the target and source store representations for
+    /// the next join.
     T t,s ;
   public:
-    virtual CPTR<joiner> clone() ;
-    virtual storeRepP getTargetRep() ;
-    virtual void SetArgs(storeRepP &target, storeRepP &source) ;
-    virtual void Join(const sequence &seq) ;
-    virtual void Join(Map &t2s, const sequence &seq)  ;
+    /// @brief Creates an unbound copy of this typed join adapter.
+    virtual CPTR<joiner> clone() {
+      return CPTR<joiner>(new joinOp<T,Op> ) ;
+    }
+
+    /// @brief Returns a prototype store representation for the reduction
+    ///   target type `T`.
+    virtual storeRepP getTargetRep() {
+      T st ;
+      return st.Rep() ;
+    }
+
+    /// @brief Binds this adapter to the concrete target and source stores used
+    ///   by the next join.
+    ///
+    /// @param[in] target Store representation that will be updated.
+    /// @param[in] source Store representation that provides incoming values.
+    virtual void SetArgs(storeRepP &target, storeRepP &source) {
+      s.setRep(source) ; t.setRep(target) ;
+    }
+
+    /// @brief Applies `Op` to matching source and target entities.
+    ///
+    /// For each entity in `seq`, this combines `source[i]` into `target[i]`.
+    ///
+    /// @param[in] seq Entity sequence whose source and target indices match.
+    virtual void Join(const sequence &seq) {
+      for(sequence::const_iterator i=seq.begin();i!=seq.end();++i) {
+        join(t[*i],s[*i]) ;
+      }
+    }
+
+    /// @brief Applies `Op` when the source entity is selected through a map.
+    ///
+    /// For each target entity `i` in `seq`, this combines `source[t2s[i]]`
+    /// into `target[i]`.
+    ///
+    /// @param[in] t2s Map from target entities to source entities.
+    /// @param[in] seq Target-side entity sequence to join.
+    virtual void Join(Map &t2s, const sequence &seq)  {
+      for(sequence::const_iterator i=seq.begin();i!=seq.end();++i) {
+        join(t[*i],s[t2s[*i]]) ;
+      }
+    }
   } ;
 
-  template <class T, class Op> CPTR<joiner> joinOp<T,Op>::clone() {
-    return CPTR<joiner>(new joinOp<T,Op> );
-  }
 
-  template <class T, class Op>  storeRepP joinOp<T,Op>::getTargetRep() {
-    T st ;
-    return st.Rep();
-  }
-  
-  template <class T, class Op>
-    void joinOp<T,Op>::SetArgs(storeRepP &target, storeRepP &source)
-  { s.setRep(source) ; t.setRep(target) ; }
-  
-  template <class T, class Op> void joinOp<T,Op>::Join(const sequence &seq) {
-    for(sequence::const_iterator i=seq.begin();i!=seq.end();++i) 
-      join(t[*i],s[*i]) ;
-  }
-  
-  
-  
-  template <class T, class Op>
-    void joinOp<T,Op>::Join(Map &t2s, const sequence &seq){ 
-    for(sequence::const_iterator i=seq.begin();i!=seq.end();++i) {
-      join(t[*i],s[t2s[*i]]) ;
-    }
-  }
-  
-  template<class Type,class Op> class joinOp<blackbox<Type>,Op> : public joiner {
+  /// Sentinel specialization for blackbox targets.
+  ///
+  /// The generic reduction runtime does not provide a blackbox join adapter, so
+  /// this specialization exists only to satisfy the interface and diagnose
+  /// unexpected use.
+  template<class Type, class Op> class joinOp<blackbox<Type>,Op> : public joiner {
     Op join ;
   public:
-    CPTR<joiner> clone() 
-      { return CPTR<joiner>(new joinOp<blackbox<Type>,Op> ); }
-    
-    virtual void SetArgs(storeRepP &target, storeRepP &source)
-    { std::cerr << "Blackbox Joiner should not be called" << std::endl; }
-    
-    virtual storeRepP getTargetRep()
-      { return 0; }
-    
-    virtual void Join(const sequence &seq)
-      {std::cerr << "Blackbox Joiner should not be called" << std::endl; }
-    
-    virtual void Join(Map &t2s, const sequence &seq)
-      {std::cerr << "Blackbox Joiner should not be called" << std::endl; }
+    CPTR<joiner> clone() {
+      return CPTR<joiner>(new joinOp<blackbox<Type>,Op> ) ;
+    }
+
+    virtual void SetArgs(storeRepP &target, storeRepP &source) {
+      std::cerr << "Blackbox Joiner should not be called" << std::endl ;
+    }
+
+    virtual storeRepP getTargetRep() {
+      return 0 ;
+    }
+
+    virtual void Join(const sequence &seq) {
+      std::cerr << "Blackbox Joiner should not be called" << std::endl ;
+    }
+
+    virtual void Join(Map &t2s, const sequence &seq) {
+      std::cerr << "Blackbox Joiner should not be called" << std::endl ;
+    }
   } ;
 
+  /// `joinOp` specialization for parameter targets.
+  ///
+  /// Parameter reductions are global reductions, so the join combines a single
+  /// source value into a single target value and ignores any entity map.
   template<class Type,class Op> class joinOp<param<Type>,Op> : public joiner {
     Op join ;
     param<Type> s,t ;
   public:
-    CPTR<joiner> clone() 
-      { return CPTR<joiner>(new joinOp<param<Type>,Op> ); }
-    
-    virtual void SetArgs(storeRepP &target, storeRepP &source)
-      { s.setRep(source) ; t.setRep(target) ; }
-    
-    virtual storeRepP getTargetRep()
-      { param<Type> st ; storeRepP rep = st.Rep(); return rep; }
-    
-    virtual void Join(const sequence &seq)
-      {join(*t,*s) ;}
-    
-    virtual void Join(Map &t2s, const sequence &seq)
-      {join(*t,*s) ;}
+    CPTR<joiner> clone() {
+      return CPTR<joiner>(new joinOp<param<Type>,Op> ) ;
+    }
+
+    virtual void SetArgs(storeRepP &target, storeRepP &source) {
+      s.setRep(source) ; t.setRep(target) ;
+    }
+
+    virtual storeRepP getTargetRep() {
+      param<Type> st ; storeRepP rep = st.Rep() ; return rep ;
+    }
+
+    virtual void Join(const sequence &seq) {
+      join(*t,*s) ;
+    }
+
+    virtual void Join(Map &t2s, const sequence &seq) {
+      join(*t,*s) ;
+    }
   } ;
 
+  /// @brief `joinOp` specialization for stores whose per-entity values are
+  ///   vectors.
+  ///
+  /// This adapter binds `storeVec` source and target stores and applies the
+  /// reduction operator `Op` to each target entity in the join sequence. Each
+  /// join combines one source vector into the corresponding target vector,
+  /// either directly by matching entity indices or through a target-to-source
+  /// map.
   template<class Type,class Op> class joinOp<storeVec<Type>,Op> : public joiner {
     Op join ;
     storeVec<Type> s,t ;
   public:
-    virtual CPTR<joiner> clone()
-      { return CPTR<joiner>(new joinOp<storeVec<Type>,Op> ); }
-    
-    virtual void SetArgs(storeRepP &target, storeRepP &source)
-      { s.setRep(source) ; t.setRep(target) ; }
-    
-    virtual storeRepP getTargetRep()
-      { storeVec<Type> st ; storeRepP rep = st.Rep(); return rep; }
-    
+    virtual CPTR<joiner> clone() {
+      return CPTR<joiner>(new joinOp<storeVec<Type>,Op> ) ;
+    }
+
+    virtual void SetArgs(storeRepP &target, storeRepP &source) {
+      s.setRep(source) ; t.setRep(target) ;
+    }
+
+    virtual storeRepP getTargetRep() {
+      storeVec<Type> st ; storeRepP rep = st.Rep() ; return rep ;
+    }
+
     virtual void Join(const sequence &seq) {
       for(sequence::const_iterator i=seq.begin();i!=seq.end();++i) {
         Vect<Type> m = t[*i] ;
@@ -532,18 +704,31 @@ namespace Loci {
     }
   } ;
 
+  /// @brief `joinOp` specialization for matrix-valued `storeMat` targets.
+  ///
+  /// This adapter binds `storeMat<Type>` source and target stores and, for
+  /// each entity in the join sequence, passes the corresponding `Mat<Type>`
+  /// views to `Op` for combination. The mapped overload only changes which
+  /// source entity is selected through `t2s`; it does not add any
+  /// matrix-specific remapping logic.
   template<class Type,class Op> class joinOp<storeMat<Type>,Op> : public joiner {
+    /// Reduction operator applied to each matrix-valued contribution.
     Op join ;
+
+    /// Bound target and source matrix stores used by the next join.
     storeMat<Type> s,t ;
   public:
-    virtual CPTR<joiner> clone()
-    { return CPTR<joiner>(new joinOp<storeMat<Type>,Op> ); }
+    virtual CPTR<joiner> clone() {
+      return CPTR<joiner>(new joinOp<storeMat<Type>,Op> ) ;
+    }
 
-    virtual void SetArgs(storeRepP &target, storeRepP &source)
-    { s.setRep(source) ; t.setRep(target) ; }
+    virtual void SetArgs(storeRepP &target, storeRepP &source) {
+      s.setRep(source) ; t.setRep(target) ;
+    }
 
-    virtual storeRepP getTargetRep()
-    { storeMat<Type> st ; storeRepP rep = st.Rep(); return rep; }
+    virtual storeRepP getTargetRep() {
+      storeMat<Type> st ; storeRepP rep = st.Rep() ; return rep ;
+    }
 
     virtual void Join(const sequence &seq) {
       for(sequence::const_iterator i=seq.begin();i!=seq.end();++i) {
@@ -560,19 +745,32 @@ namespace Loci {
     }
   } ;
 
+  /// @brief `joinOp` specialization for `multiStore` targets.
+  ///
+  /// A `multiStore<Type>` holds a variable-length `Vect<Type>` for each entity.
+  /// This adapter binds source and target `multiStore`s and applies `Op` to the
+  /// per-entity vectors selected by the join sequence. The mapped overload uses
+  /// `t2s` only to choose the source entity; it does not change the contents or
+  /// shape of each per-entity vector.
   template<class Type, class Op> class joinOp<multiStore<Type>,Op> :
   public joiner {
+    /// Reduction operator applied to each per-entity vector.
     Op join ;
+
+    /// Bound source and target multiStores used by the next join.
     multiStore<Type> s,t ;
   public:
-    virtual CPTR<joiner> clone()
-    { return CPTR<joiner>(new joinOp<multiStore<Type>,Op> ); }
+    virtual CPTR<joiner> clone() {
+      return CPTR<joiner>(new joinOp<multiStore<Type>,Op> ) ;
+    }
 
-    virtual void SetArgs(storeRepP &target, storeRepP &source)
-    { s.setRep(source) ; t.setRep(target) ; }
+    virtual void SetArgs(storeRepP &target, storeRepP &source) {
+      s.setRep(source) ; t.setRep(target) ;
+    }
 
-    virtual storeRepP getTargetRep()
-    { multiStore<Type> st ; storeRepP rep = st.Rep(); return rep; }
+    virtual storeRepP getTargetRep() {
+      multiStore<Type> st ; storeRepP rep = st.Rep() ; return rep ;
+    }
 
     virtual void Join(const sequence &seq) {
       for(sequence::const_iterator i=seq.begin();i!=seq.end();++i) {
@@ -588,34 +786,46 @@ namespace Loci {
       }
     }
   } ;
-    
+
+  /// Base class for reduction rules that accumulate contributions with `Op`.
+  ///
+  /// User code calls the protected `join(...)` helper inside the rule body to
+  /// combine one contribution into the target. `get_joiner()` exposes the same
+  /// operation to the runtime so partial results can be merged after threaded or
+  /// distributed execution.
+  ///
+  /// @tparam T Target store type reduced by the rule.
+  /// @tparam Op Reduction operator used to combine contributions.
   template <class T, class Op > class apply_rule : public rule_impl {
   protected:
     apply_rule() { rule_class(APPLY) ; }
-    void name_store(const std::string &n, store_instance &si)
-    { rule_impl::name_store(n,si) ; }
-    void input(const std::string &invar)
-    { rule_impl::input(invar) ; }
-    void output(const std::string &outvar)
-    { rule_impl::output(outvar) ; }
-    void constraint(const std::string &constrain)
-    { rule_impl::constraint(constrain) ; }
-    void conditional(const std::string &cond)
-    { rule_impl::conditional(cond) ; }
+    void name_store(const std::string &n, store_instance &si) {
+      rule_impl::name_store(n,si) ;
+    }
+    void input(const std::string &invar) {
+      rule_impl::input(invar) ;
+    }
+    void output(const std::string &outvar) {
+      rule_impl::output(outvar) ;
+    }
+    void constraint(const std::string &constrain) {
+      rule_impl::constraint(constrain) ;
+    }
+    void conditional(const std::string &cond) {
+      rule_impl::conditional(cond) ;
+    }
     void join(typename T::containerType &t1,
               const typename T::containerType &t2) {
       Op f ;
       f(t1,t2) ;
     }
-    
-    template<class U> void join(Vect<U> t1,
-                                const_Vect<U> t2) {
+
+    template<class U> void join(Vect<U> t1, const_Vect<U> t2) {
       Op f ;
       f(t1,t2) ;
     }
 
-    template<class U> void join(Mat<U> t1,
-                                const_Mat<U> t2) {
+    template<class U> void join(Mat<U> t1, const_Mat<U> t2) {
       Op f ;
       f(t1,t2) ;
     }
@@ -626,72 +836,108 @@ namespace Loci {
     }
 
   } ;
-  
+
+  /// @brief Common reduction operators used as the `Op` argument to
+  ///   `apply_rule`.
+  ///
+  /// `apply_rule` uses these function objects both in user-visible
+  /// `join(...)` calls inside the rule body and in the runtime `joiner`
+  /// adapter that merges partial results.
+
+  /// @brief Marker operator for `apply_rule`s that do not expect a runtime
+  ///   join step.
+  ///
+  /// `NullOp` is commonly used when the useful work happens in the rule body
+  /// or prelude. If the runtime reduction machinery attempts to invoke the
+  /// join operator, this implementation reports that unexpected call.
   template <class T> struct NullOp {
-    void operator()(T &res, const T &arg)
-    { std::cerr << "join should not be called for NullOp" << std::endl; }
-    void operator()(Vect<T> &res, const Vect<T> &arg)
-    { std::cerr << "join should not be called for NullOp" << std::endl; }
+    void operator()(T &res, const T &arg) {
+      std::cerr << "join should not be called for NullOp" << std::endl ;
+    }
+    void operator()(Vect<T> &res, const Vect<T> &arg) {
+      std::cerr << "join should not be called for NullOp" << std::endl ;
+    }
   } ;
 
+  /// @brief Reduction operator that adds each contribution into the
+  ///   accumulated result.
   template <class T> struct Summation {
-    void operator()(T &res, const T &arg)
-    { res += arg ; }
-    template <class U> void operator()(T &res, const U &arg)
-    { res += arg ; }
+    void operator()(T &res, const T &arg) {
+      res += arg ;
+    }
+    template <class U> void operator()(T &res, const U &arg) {
+      res += arg ;
+    }
   } ;
 
+  /// @brief Reduction operator that multiplies each contribution into the
+  ///   accumulated result.
   template <class T> struct Product {
-    void operator()(T &res, const T &arg)
-    { res *= arg ; }
-    template <class U> void operator()(T &res, const U &arg)
-    { res *= arg ; }
-
+    void operator()(T &res, const T &arg) {
+      res *= arg ;
+    }
+    template <class U> void operator()(T &res, const U &arg) {
+      res *= arg ;
+    }
   } ;
 
+  /// @brief Reduction operator that keeps the maximum contribution seen so
+  ///   far.
   template <class T> struct Maximum {
-    void operator()(T &res ,const T &arg)
-    { res = max(res,arg) ; }
-    template <class U> void operator()(T &res, const U &arg)
-    { res = max(res,arg) ; }
+    void operator()(T &res ,const T &arg) {
+      res = max(res,arg) ;
+    }
+    template <class U> void operator()(T &res, const U &arg) {
+      res = max(res,arg) ;
+    }
   } ;
+
+  /// @brief `Vect` specialization of `Maximum` that applies the maximum
+  ///   elementwise.
   template <class T> struct Maximum<Vect<T> > {
-    template <class U> void operator()(Vect<T> &res ,const U &arg)
-    {
+    template <class U> void operator()(Vect<T> &res ,const U &arg) {
       int vs = res.getSize() ;
-      for(int i=0;i<vs;++i)
+      for(int i=0;i<vs;++i) {
         res[i] = max(res[i],arg[i]) ;
+      }
     }
-  } ;  
-
-  template <class T> struct Minimum {
-    void operator()(T &res, const T &arg)
-    { res = min(res,arg) ; }
-    template <class U> void operator()(T &res, const U &arg)
-    { res = min(res,arg) ; }
   } ;
-  template <class T> struct Minimum<Vect<T> > {
-    template <class U> void operator()(Vect<T> &res ,const U &arg)
-    {
-      int vs = res.getSize() ;
-      for(int i=0;i<vs;++i)
-        res[i] = min(res[i],arg[i]) ;
-    }
-  } ;  
 
-  
+  /// @brief Reduction operator that keeps the minimum contribution seen so
+  ///   far.
+  template <class T> struct Minimum {
+    void operator()(T &res, const T &arg) {
+      res = min(res,arg) ;
+    }
+    template <class U> void operator()(T &res, const U &arg) {
+      res = min(res,arg) ;
+    }
+  } ;
+
+  /// @brief `Vect` specialization of `Minimum` that applies the minimum
+  ///   elementwise.
+  template <class T> struct Minimum<Vect<T> > {
+    template <class U> void operator()(Vect<T> &res ,const U &arg) {
+      int vs = res.getSize() ;
+      for(int i=0;i<vs;++i) {
+        res[i] = min(res[i],arg[i]) ;
+      }
+    }
+  } ;
+
+
   class rule {
   public:
     enum rule_type {BUILD=0,COLLAPSE=1,GENERIC=2,TIME_SPECIFIC=3,INTERNAL=4} ;
     struct info {
       rule_implP rule_impl ;
-      
+
       rule_impl::info desc ;
-      
+
       std::string rule_ident ;
       time_ident source_level, target_level ;
       variableSet source_vars, target_vars, map_vars, constraint_vars ;
-      
+
       rule_type rule_class ;
       bool output_is_parameter ;
       bool time_advance ;
@@ -711,18 +957,18 @@ namespace Loci {
       const variableSet &targets() const { return target_vars ; }
       const variableSet &maps() const { return map_vars ; }
       const variableSet &constraints() const {return constraint_vars; }
-      
+
       const std::string &qualifier() const { return internal_qualifier ; }
       rule_type type() const { return rule_class ; }
       time_ident target_time() const { return target_level ; }
       time_ident source_time() const { return source_level ; }
       time_ident time() const { return source_level ; }
       int ident() const { return rule::rdb->get_id(*this) ; }
-      
+
       rule_implP get_rule_implP() const ;
       // SH - namespace support
-      rule_implP add_namespace(const std::string& n) const { 
-	return rule_impl->add_namespace(n) ;
+      rule_implP add_namespace(const std::string& n) const {
+	      return rule_impl->add_namespace(n) ;
       }
     } ;
   private:
@@ -749,57 +995,64 @@ namespace Loci {
         return fmi->second ;
       }
       int query_name(std::string &name) {
-	std::map<std::string,int>::iterator fmi ;
-	if((fmi = fmap.find(name)) == fmap.end()) {
-	  fmi = fmap.find("NO_RULE");
-	}
+        std::map<std::string,int>::iterator fmi ;
+        if((fmi = fmap.find(name)) == fmap.end()) {
+          fmi = fmap.find("NO_RULE");
+        }
 
-	return fmi->second;
+        return fmi->second;
       }
       const info &get_info(int id) const { return fiv[-(id+1)] ; }
     } ;
-    
+
     static rule_db *rdb ;
     int id ;
     void create_rdb() {
-      if(0==rdb) { 
-	rdb = new rule::rule_db ;
-	rule();
+      if(0==rdb) {
+        rdb = new rule::rule_db ;
+        rule() ;
       }
     }
   protected:
-    rule(const rule::info& ri)
-      { create_rdb(); id = rdb->get_id(ri) ; }
+    rule(const rule::info& ri) {
+      create_rdb() ; id = rdb->get_id(ri) ;
+    }
   public:
-    static void rdb_cleanup() { if(rdb) { delete rdb ; rdb = 0; } }
-    static int rdb_size()
-    { WARN(rdb->fiv.size() != rdb->fmap.size()) ; return rdb->fiv.size() ; }
+    static void rdb_cleanup() { if(rdb) { delete rdb ; rdb = 0 ; } }
+    static int rdb_size() {
+      WARN(rdb->fiv.size() != rdb->fmap.size()) ; return rdb->fiv.size() ;
+    }
     rule() { create_rdb() ; id = rdb->get_id(info()) ;}
-    explicit rule(int i)
-      { create_rdb(); id = i ; }
-    rule(const rule_implP &fp)
-      { create_rdb(); id = rdb->get_id(info(fp)) ;}
-    rule(rule f, time_ident tl)
-      { create_rdb(); id = rdb->get_id(info(rdb->get_info(f.id),tl)) ; }
-    // prepend time_ident to rule f
-    rule(time_ident tl, rule f)
-      { create_rdb(); id = rdb->get_id(info(tl,rdb->get_info(f.id))) ; }
-    rule(const std::string &s)
-      { create_rdb(); id = rdb->get_id(info(s)) ; }
-      
-    // SH - Namespace support
-    // We use a new rule_implP identical to the original but with namespace'd variables to construct a new rule (rule(rule_implP&))
-    // get_rule_implP() gives us our rule_implP for this rule, the rule_implP adds the namespace to a copy of itself
-    rule add_namespace(const std::string& n) const { 
-      return rule(get_rule_implP()->add_namespace(n));
-    } 
+    explicit rule(int i) {
+      create_rdb() ; id = i ;
+    }
+    rule(const rule_implP &fp) {
+      create_rdb() ; id = rdb->get_id(info(fp)) ;
+    }
+    rule(rule f, time_ident tl) {
+      create_rdb() ; id = rdb->get_id(info(rdb->get_info(f.id),tl)) ;
+    }
+    /// Prepend time_ident to rule f
+    rule(time_ident tl, rule f) {
+      create_rdb() ; id = rdb->get_id(info(tl,rdb->get_info(f.id))) ;
+    }
+    rule(const std::string &s) {
+      create_rdb() ; id = rdb->get_id(info(s)) ;
+    }
+
+    /// SH - Namespace support
+    /// We use a new rule_implP identical to the original but with namespace'd variables to construct a new rule (rule(rule_implP&))
+    /// get_rule_implP() gives us our rule_implP for this rule, the rule_implP adds the namespace to a copy of itself
+    rule add_namespace(const std::string& n) const {
+      return rule(get_rule_implP()->add_namespace(n)) ;
+    }
     rule parent() const { return rule(*this,time().parent()) ; }
 
-    /* 
-    std::ostream &Print(std::ostream &s) const
-      { s << rdb->get_info(id).name() ; return s ; }
-    */
-    // remove the stuffs before "#" if any.
+    //std::ostream &Print(std::ostream &s) const
+    //    { s << rdb->get_info(id).name() ; return s ; }
+    //
+
+    /// Remove the stuff before "#", if any.
     std::ostream &Print(std::ostream &s) const {
       std::string name = rdb->get_info(id).name() ;
       std::string::iterator pos ;
@@ -807,7 +1060,6 @@ namespace Loci {
       s << std::string( (pos==name.end()?name.begin():pos+1),name.end()) ;
       return s ;
     }
-        
     bool operator<(const rule &f) const { return id < f.id ; }
     bool operator==(const rule &f) const { return id == f.id ; }
     bool operator!=(const rule &f) const { return id != f.id ; }
@@ -819,9 +1071,8 @@ namespace Loci {
     const variableSet &sources() const { return rdb->get_info(id).sources(); }
     const variableSet &targets() const { return rdb->get_info(id).targets(); }
 
-    // rename function that renames variables in the rule
-    // according to the rename map passed in. It is the
-    // general interface for rule promotion.
+    /// Rename function that renames variables in the rule according to the
+    /// rename map passed in. It is the general interface for rule promotion.
     rule rename_vars(std::map<variable,variable>& rvm) const ;
     rule_type type() const { return rdb->get_info(id).type() ; }
     time_ident target_time() const { return rdb->get_info(id).target_time() ;}
@@ -830,68 +1081,92 @@ namespace Loci {
     rule_implP get_rule_implP() const { return rdb->get_info(id).get_rule_implP() ;}
   } ;
 
-  inline std::ostream &operator<<(std::ostream &s, const rule &f)
-    { return f.Print(s) ; }
+  inline std::ostream &operator<<(std::ostream &s, const rule &f) {
+    return f.Print(s) ;
+  }
 
-  // global rule promotion functions
-  // rule promotion
+  /// Global rule promotion functions rule promotion
   rule promote_rule(const rule& r, const time_ident& t) ;
-  // time prepend to a rule
+
+  /// Time prepend to a rule
   rule prepend_rule(const rule& r, const time_ident& t) ;
 
+  /// @brief Typed set of `rule` handles backed by `intervalSet`.
+  ///
+  /// `ruleSet` reuses the interval-based set algebra provided by
+  /// `intervalSet`, but exposes membership tests and iteration in terms of
+  /// `rule` objects rather than raw integer identifiers. This makes it the
+  /// common set type for rule collections throughout the rule database,
+  /// dependency-graph, and scheduling code.
+  ///
+  /// Because rule identifiers occupy the negative side of the shared graph
+  /// vertex space, helpers such as `extract_rules()` can also construct a
+  /// `ruleSet` directly from graph-derived `intervalSet`s.
   class ruleSet : public intervalSet {
   public:
     ruleSet() {}
     explicit ruleSet(const exprP &e) ;
-    explicit ruleSet(const intervalSet &v)
-      {*(static_cast<intervalSet *>(this)) = v ;}
-    ruleSet &operator=(const intervalSet &v)
-      {*(static_cast<intervalSet *>(this)) = v ; return *this ;}
-    ruleSet &operator+=(const rule &v)
-      { *this += v.ident() ; return *this ; }
-    ruleSet &operator-=(const rule &v)
-      { *this -= v.ident() ; return *this ; }
-    bool inSet(const rule &v) const
-      { return intervalSet::inSet(v.ident()) ; }
+    explicit ruleSet(const intervalSet &v) {
+      *(static_cast<intervalSet *>(this)) = v ;
+    }
+    ruleSet &operator=(const intervalSet &v) {
+      *(static_cast<intervalSet *>(this)) = v ; return *this ;
+    }
+    ruleSet &operator+=(const rule &v) {
+      *this += v.ident() ; return *this ;
+    }
+    ruleSet &operator-=(const rule &v) {
+      *this -= v.ident() ; return *this ;
+    }
+    bool inSet(const rule &v) const {
+      return intervalSet::inSet(v.ident()) ;
+    }
     class ruleSetIterator {
       intervalSet::const_iterator ii ;
     public:
       ruleSetIterator() {}
-      ruleSetIterator(const intervalSet::const_iterator &i)
-        { ii = i ; }
+      ruleSetIterator(const intervalSet::const_iterator &i) {
+        ii = i ;
+      }
       rule operator*() const { return rule(*ii) ; }
-      const rule::info *operator->() const
-        { return &(rule(*ii).get_info()) ; }
-      ruleSetIterator &operator++() { ++ii ; return *this ;}
-      ruleSetIterator operator++(int )
-        { return ruleSetIterator(ii++); }
-      bool operator==(const ruleSetIterator &i) const 
-        { return ii == i.ii ; }
-      bool operator!=(const ruleSetIterator &i) const
-        { return ii != i.ii ; } ;
+      const rule::info *operator->() const {
+        return &(rule(*ii).get_info()) ;
+      }
+      ruleSetIterator &operator++() { ++ii ; return *this ; }
+      ruleSetIterator operator++(int) {
+        return ruleSetIterator(ii++) ;
+      }
+      bool operator==(const ruleSetIterator &i) const {
+        return ii == i.ii ;
+      }
+      bool operator!=(const ruleSetIterator &i) const {
+        return ii != i.ii ;
+      }
     } ;
     typedef ruleSetIterator const_iterator ;
     const_iterator begin() const {
-      return const_iterator(intervalSet::begin()) ; }
+      return const_iterator(intervalSet::begin()) ;
+    }
     const_iterator end() const {
-      return const_iterator(intervalSet::end()) ; }
+      return const_iterator(intervalSet::end()) ;
+    }
     std::ostream &Print(std::ostream &s) const ;
 
   } ;
 
-  inline std::ostream &operator<<(std::ostream &s, const ruleSet& v)
-    { return v.Print(s) ; }
+  inline std::ostream &operator<<(std::ostream &s, const ruleSet& v) {
+    return v.Print(s) ;
+  }
 
   class register_rule_type {
   public:
       virtual ~register_rule_type() {}
       virtual rule_implP get_func() const = 0 ;
       virtual bool is_module_rule() const = 0 ;
-      
-  } ; 
+  } ;
 
   class register_rule_impl_list ;
-  
+
   class rule_impl_list {
   public:
     class rule_list_iterator ;
@@ -920,15 +1195,15 @@ namespace Loci {
         p = p->next ;
         return tmp ;
       }
-      rule_list_ent* get_p() { return p; } 
+      rule_list_ent* get_p() { return p; }
       bool operator==(const rule_list_iterator &i) { return i.p == p ; }
       bool operator!=(const rule_list_iterator &i) { return i.p != p ; }
     } ;
     typedef rule_list_iterator iterator ;
-    
+
     rule_impl_list() {list = 0 ; }
     ~rule_impl_list() ;
-    
+
     void push_rule(register_rule_type *rr) ;
     iterator begin() { return iterator(list) ; }
     iterator end() { return iterator(0) ; }
@@ -945,6 +1220,7 @@ namespace Loci {
       return *this ;
     }
   } ;
+
   class register_rule_impl_list : public rule_impl_list {
   public:
     static rule_list_ent *global_list ;
@@ -956,15 +1232,15 @@ namespace Loci {
     iterator begin() { return iterator(global_list) ; }
     iterator end() { return iterator(0) ; }
   } ;
-  extern register_rule_impl_list register_rule_list ;    
-  extern rule_impl_list global_rule_list ;    
+  extern register_rule_impl_list register_rule_list ;
+  extern rule_impl_list global_rule_list ;
   template<class T> class register_rule : public register_rule_type {
   public:
     register_rule() { register_rule_list.push_rule(this) ; }
     virtual bool is_module_rule()  const{ return false; }
     virtual rule_implP get_func() const { return new copy_rule_impl<T> ; }
   } ;
-  
+
   class register_module : public register_rule_type {
   public:
     register_module() { register_rule_list.push_rule(this) ; }
@@ -978,11 +1254,10 @@ namespace Loci {
     virtual std::string load_nspace() const ;
     virtual std::string disable_compute_vars() const ;
   } ;
-  
+
   class rule_db {
     typedef std::map<variable,ruleSet> varmap ;
     typedef varmap::const_iterator vc_iterator ;
-      
     static const ruleSet EMPTY_RULE ;
     ruleSet known_rules ;
     // rules set for default and optional rules
@@ -1000,7 +1275,6 @@ namespace Loci {
     void add_rules(register_rule_impl_list &gfl) ;
     void remove_rule(rule f) ;
     void remove_rules(const ruleSet& rs) ;
-    
     const ruleSet &all_rules() const { return known_rules ; }
     // return all the rules in "keyspace_tag"
     const ruleSet& all_rules(const std::string& keyspace_tag) const {
@@ -1011,8 +1285,8 @@ namespace Loci {
       else
         return mi->second ;
     }
-    const ruleSet& get_default_rules() const {return default_rules ;}
-    const ruleSet& get_optional_rules() const {return optional_rules ;}
+    const ruleSet& get_default_rules() const { return default_rules ; }
+    const ruleSet& get_optional_rules() const { return optional_rules ; }
     const ruleSet &rules_by_source(variable v) const {
       vc_iterator vmi = srcs2rule.find(v) ;
       if(vmi == srcs2rule.end())
@@ -1027,7 +1301,7 @@ namespace Loci {
       else
         return vmi->second;
     }
-      
+
   } ;
 
 }
