@@ -1,0 +1,657 @@
+//#############################################################################
+//#
+//# Copyright 2026, Mississippi State University
+//#
+//# This file is part of the Loci Framework.
+//#
+//# The Loci Framework is free software: you can redistribute it and/or modify
+//# it under the terms of the Lesser GNU General Public License as published by
+//# the Free Software Foundation, either version 3 of the License, or
+//# (at your option) any later version.
+//#
+//# The Loci Framework is distributed in the hope that it will be useful,
+//# but WITHOUT ANY WARRANTY; without even the implied warranty of
+//# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//# Lesser GNU General Public License for more details.
+//#
+//# You should have received a copy of the Lesser GNU General Public License
+//# along with the Loci Framework.  If not, see <http://www.gnu.org/licenses>
+//#
+//#############################################################################
+#include <Loci.h>
+#include <mpi_containerIO.h>
+#include <parSampleSort.h>
+#include <FVMAdapt/sciTypes.h>
+#include <FVMAMR/amr.h>
+#include <algorithm>
+#include <functional>
+#include <limits>
+#include <vector>
+
+$include "FVM.lh"
+$include "FVMAMR/amr.lh"
+
+namespace Loci {
+
+  using std::cout ;
+  using std::endl ;
+  using std::max ;
+  using std::min ;
+  using std::vector ;
+  typedef real_t real ;
+
+  //---------------------------------------------------------------------------
+  // Vars-file defaults and common adaptation controls
+
+  /// Maximum number of adaptation steps to perform. The solver decides how this
+  /// limit participates in its timestep loop.
+  $rule default(maxAdaptSteps) { $maxAdaptSteps = 0 ; }
+
+  /// adaptMode can be "isotropic", "anisotropic", or "2D".
+  $rule default(adaptMode) { $adaptMode = "anisotropic" ; }
+
+  $rule constraint(adaptMode2D,adaptMode3D<-adaptMode) {
+    $adaptMode2D = EMPTY ;
+    $adaptMode3D = EMPTY ;
+    if($adaptMode == "2D") {
+      $adaptMode2D = ~EMPTY ;
+    } else {
+      $adaptMode3D = ~EMPTY ;
+    }
+  }
+
+  /// Minimum edge length allowed for refinement.
+  $rule default(adaptMinEdgeLength) { $adaptMinEdgeLength = 1e-6 ; }
+
+  /// Face folding criterion used by the FVMAdapt remesher.
+  $rule default(adaptFaceFold) { $adaptFaceFold = 1.5708 ; }
+
+  /// Mesh balancing method used to balance refinement levels.
+  $rule default(adaptBalanceType) { $adaptBalanceType = 0 ; }
+
+  /// Solver-side cadence controls.
+  $rule optional(adaptFrequency) { $adaptFrequency = 100 ; }
+  $rule default(adaptStart) { $adaptStart = 100 ; }
+
+  /// Error thresholds for refinement and de-refinement.
+  $rule default(adaptSensitivity) { $adaptSensitivity = 1.0 ; }
+  $rule default(coarsenSensitivity) { $coarsenSensitivity = 0.5 ; }
+
+  /// Selects error metrics to use for refinement.
+  $rule optional(adaptSensor) { $adaptSensor = "" ; }
+
+  /// Maximum number of cells in adaptation phase, in millions of cells.
+  $rule default(maxAdaptCellCount) { $maxAdaptCellCount = -1. ; }
+
+  $type numCells param<double> ;
+
+  /// Current mesh cell count, in millions, used to cap requested refinement.
+  $rule unit(numCells),constraint(UNIVERSE) { $numCells = 0 ; }
+
+  $rule apply(numCells<-vol)[Loci::Summation],constraint(geom_cells),prelude {
+    *$numCells += double(seq.size())*1.0e-6 ;
+  } ;
+
+  /// Default partition weighting for solvers that do not provide their own
+  /// post-AMR repartition hints.
+  $rule pointwise(cellPartitionWeights),constraint(geom_cells) {
+    $cellPartitionWeights = 1 ;
+  }
+
+  $type maxRefineCellCount param<int> ;
+
+  /// Estimate how many cells may be refined before reaching maxAdaptCellCount.
+  $rule singleton(maxRefineCellCount<-numCells,maxAdaptCellCount,adaptMode) {
+    double factor = 1.e6/7.0 ;
+    if($adaptMode == "2D") {
+      factor = 1.e6/3.0 ;
+    }
+    $maxRefineCellCount = std::numeric_limits<int>::max() ;
+    if($maxAdaptCellCount > 0) {
+      $maxRefineCellCount = int(max($maxAdaptCellCount-$numCells,0.0)*factor) ;
+    }
+    $[Once] {
+      cout << "maxAdaptCellCount=" << $maxAdaptCellCount
+           << ", numCells=" << $numCells
+           << ", maxRefineCellCount=" << $maxRefineCellCount
+           << endl ;
+    }
+  }
+
+  //---------------------------------------------------------------------------
+  // Cell-based adaptation flags
+
+  $rule unit(cellMaxEdgeLength),constraint(geom_cells) {
+    $cellMaxEdgeLength = 0 ;
+  }
+
+  $rule apply((cl,cr)->cellMaxEdgeLength<-area,face2node->pos)[Loci::Maximum],
+  constraint(adaptMode3D,(cl,cr)->geom_cells) {
+    real len = 0 ;
+    int fsz = $face2node.size() ;
+    for(int i=0;i<fsz;++i) {
+      int ip = ((i+1)==fsz)?0:i+1 ;
+      real elen = norm($face2node[ip]->$pos-$face2node[i]->$pos) ;
+      join($cl->$cellMaxEdgeLength,elen) ;
+      join($cr->$cellMaxEdgeLength,elen) ;
+      len += elen ;
+    }
+    real estlen = 4.0*$area.sada/len ;
+    join($cl->$cellMaxEdgeLength,estlen) ;
+    join($cr->$cellMaxEdgeLength,estlen) ;
+  }
+
+  $rule apply(ci->cellMaxEdgeLength<-area,face2node->pos)[Loci::Maximum],
+  constraint(adaptMode2D,ci->geom_cells) {
+    if(fabs(fabs($area.n.z)-1.0) < 1e-8) {
+      real len = 0 ;
+      int fsz = $face2node.size() ;
+      for(int i=0;i<fsz;++i) {
+        int ip = ((i+1)==fsz)?0:i+1 ;
+        real elen = norm($face2node[ip]->$pos-$face2node[i]->$pos) ;
+        join($ci->$cellMaxEdgeLength,elen) ;
+        len += elen ;
+      }
+      join($ci->$cellMaxEdgeLength,4.*$area.sada/len) ;
+    }
+  }
+
+  /// Unit/apply sequence for solver-independent refinement protection masks.
+  /// Solvers may add additional apply rules to mark cells based on their own
+  /// physics or region criteria.
+  $rule unit(cellAdaptMask),constraint(geom_cells) {
+    $cellAdaptMask = 0 ;
+  }
+
+  /// Protect cells that are already below the minimum edge-length target from
+  /// additional refinement.
+  $rule apply(cellAdaptMask<-cellMaxEdgeLength,adaptMinEdgeLength)
+  [Loci::Maximum],constraint(geom_cells) {
+    if($cellMaxEdgeLength < $adaptMinEdgeLength) {
+      join($cellAdaptMask,1) ;
+    }
+  }
+
+  //---------------------------------------------------------------------------
+  // Sensor normalization and thresholding
+
+  $rule unit(cellMeanCount),constraint(geom_cells) {
+    $cellMeanCount = 0 ;
+  }
+
+  $rule apply(cellMeanCount<-vol)[Loci::Summation],constraint(geom_cells) {
+    join($cellMeanCount,1) ;
+  }
+
+  $type Xf store<real> ;
+
+  $rule unit(cellMean(Xf)),constraint(Xf,geom_cells) {
+    $cellMean(Xf) = 0 ;
+  }
+
+  $rule apply(cellMean(Xf)<-Xf,cellMeanCount)[Loci::Summation] {
+    join($cellMean(Xf),double($Xf)/double($cellMeanCount)) ;
+  }
+
+  $rule unit(cellSigmaSq(Xf)),constraint(Xf,geom_cells) {
+    $cellSigmaSq(Xf) = 0 ;
+  }
+
+  $rule apply(cellSigmaSq(Xf)<-Xf,cellMean(Xf),cellMeanCount)[Loci::Summation] {
+    double delta = $Xf-$cellMean(Xf) ;
+    double term = 0 ;
+    if($cellMeanCount > 1)
+      term = delta*delta/($cellMeanCount-1) ;
+    join($cellSigmaSq(Xf),term) ;
+  }
+
+  $type ERRVAR store<real> ;
+
+  $rule unit(totScaledError),constraint(geom_cells) {
+    $totScaledError = 0 ;
+  }
+
+  /// Add normalized sensor values to the total scaled error. Applications
+  /// enable a sensor by creating parametric facts named adaptSensor(ERRVAR).
+  $rule apply(totScaledError<-ERRVAR,cellMean(ERRVAR),
+    cellSigmaSq(ERRVAR))[Loci::Maximum],
+  parametric(adaptSensor(ERRVAR)) {
+    real sigma = sqrt($cellSigmaSq(ERRVAR)) ;
+    real err_scaled = ($ERRVAR-$cellMean(ERRVAR))/(sigma+1e-30) ;
+    join($totScaledError,err_scaled) ;
+  }
+
+  $rule unit(limitedAdaptSensitivity),constraint(geom_cells) {
+    $limitedAdaptSensitivity = 0 ;
+  }
+
+  /// If the requested threshold would exceed the cell-count limit, raise the
+  /// effective threshold to the parallel sorted pivot that meets the limit.
+  $rule apply(limitedAdaptSensitivity<-totScaledError,adaptSensitivity,
+    cellAdaptMask,maxRefineCellCount)[Loci::NullOp],
+  option(disable_threading),prelude {
+    double sensitivity = *$adaptSensitivity ;
+    *$limitedAdaptSensitivity = sensitivity ;
+
+    int cnt = 0 ;
+    entitySet domain = entitySet(seq) ;
+    FORALL(domain,ii) {
+      if($cellAdaptMask[ii] == 0 && $totScaledError[ii] > sensitivity)
+        cnt++ ;
+    } ENDFORALL ;
+
+    vector<int> refsizes(Loci::MPI_processes,0) ;
+    MPI_Allgather(&cnt,1,MPI_INT,&refsizes[0],1,MPI_INT,MPI_COMM_WORLD) ;
+    int totsize = 0 ;
+    for(int i=0;i<Loci::MPI_processes;++i)
+      totsize += refsizes[i] ;
+
+    int targetRefineCells = *$maxRefineCellCount ;
+    if(totsize > targetRefineCells) {
+      vector<double> errorList(cnt) ;
+      cnt = 0 ;
+      FORALL(domain,ii) {
+        if($cellAdaptMask[ii] == 0 && $totScaledError[ii] > sensitivity)
+          errorList[cnt++] = $totScaledError[ii] ;
+      } ENDFORALL ;
+
+      Loci::parSampleSort(errorList,std::greater<double>(),MPI_COMM_WORLD) ;
+
+      cnt = errorList.size() ;
+      MPI_Allgather(&cnt,1,MPI_INT,&refsizes[0],1,MPI_INT,MPI_COMM_WORLD) ;
+      int remainingCells = targetRefineCells ;
+      int source_rank = 0 ;
+      for(int i=0;i<Loci::MPI_processes;++i) {
+        if(remainingCells < refsizes[i]) {
+          source_rank = i ;
+          break ;
+        }
+        remainingCells -= refsizes[i] ;
+      }
+
+      if(Loci::MPI_rank == source_rank)
+        sensitivity = errorList[min<int>(remainingCells,errorList.size()-1)] ;
+      MPI_Bcast(&sensitivity,1,MPI_DOUBLE,source_rank,MPI_COMM_WORLD) ;
+      *$limitedAdaptSensitivity = sensitivity ;
+    }
+  } ;
+
+  template <class T> struct AMRFlagCombine {
+    void operator()(T &res,const T &arg) const
+    {
+      if(arg > 0) {
+        res = 1 ;
+      } else if(arg < 0 && res <= 0) {
+        res = -1 ;
+      }
+    }
+  } ;
+
+  /// Base cell flag: 1 means refine, -1 means de-refine, and 0 means unchanged.
+  $rule unit(cellRefFlag),constraint(geom_cells) {
+    $cellRefFlag = 0 ;
+  }
+
+  $rule apply(cellRefFlag<-totScaledError,limitedAdaptSensitivity,
+  coarsenSensitivity)[AMRFlagCombine] {
+    int flag = 0 ;
+    if($totScaledError > $limitedAdaptSensitivity) {
+      flag = 1 ;
+    }
+    if($totScaledError < -$coarsenSensitivity) {
+      flag = -1 ;
+    }
+    join($cellRefFlag,flag) ;
+  }
+
+  $rule pointwise(cellRefFlagMask<-cellAdaptMask,cellRefFlag) {
+    $cellRefFlagMask = $cellRefFlag ;
+    if($cellRefFlag > 0 && $cellAdaptMask != 0)
+      $cellRefFlagMask = 0 ;
+  }
+
+  $rule unit(refCount),constraint(UNIVERSE) {
+    $refCount = 0 ;
+  }
+
+  $rule apply(refCount<-cellRefFlagMask)[Loci::Summation] {
+    int cnt = ($cellRefFlagMask > 0)?1:0 ;
+    join($refCount,cnt) ;
+  }
+
+  $rule unit(derefCount),constraint(UNIVERSE) {
+    $derefCount = 0 ;
+  }
+
+  $rule apply(derefCount<-cellRefFlagMask)[Loci::Summation] {
+    int cnt = ($cellRefFlagMask < 0)?1:0 ;
+    join($derefCount,cnt) ;
+  }
+
+  /// Solver cadence rules can use adaptTagsActive to avoid requesting an AMR
+  /// cycle when the generic tagging pass has selected no cells.
+  $rule constraint(adaptTagsActive<-refCount,derefCount) {
+    $adaptTagsActive = (($refCount + $derefCount) > 0)?~EMPTY:EMPTY ;
+  }
+
+  //---------------------------------------------------------------------------
+  // FVMAdapt database staging
+
+  $rule pointwise(cellRefineTag<-cellRefFlagMask) {
+    if($cellRefFlagMask > 0) {
+      $cellRefineTag = 1 ;
+    } else if($cellRefFlagMask < 0) {
+      $cellRefineTag = 2 ;
+    } else {
+      $cellRefineTag = 0 ;
+    }
+  }
+
+  $rule unit(amrTagCount),constraint(UNIVERSE) {
+    $amrTagCount = 0 ;
+  }
+
+  $rule apply(amrTagCount<-cellRefineTag)[Loci::Summation] {
+    int cnt = ($cellRefineTag == 0)?0:1 ;
+    join($amrTagCount,cnt) ;
+  }
+
+  $rule pointwise(OUTPUT<-cellPartitionWeights),conditional(do_adapt),
+  constraint(geom_cells),option(disable_threading),prelude {
+    entitySet dom = entitySet(seq) ;
+    fact_db::distribute_infoP dist =
+      Loci::exec_current_fact_db->get_distribute_info() ;
+    int offset = 0 ;
+    Loci::storeRepP vardist =
+      Loci::Local2FileOrder($cellPartitionWeights.Rep(),dom,offset,dist,
+                            MPI_COMM_WORLD) ;
+    Loci::replaceAMRDBItem(Loci::AMR_DB_CELL_PARTITION_WEIGHTS,vardist) ;
+  } ;
+
+  $rule pointwise(OUTPUT<-cellRefineTag,amrTagCount),conditional(do_adapt),
+  constraint(geom_cells),option(disable_threading),prelude {
+    Loci::clearAMRParentChildKeys() ;
+
+    if(*$amrTagCount == 0) {
+      Loci::deleteAMRDBItem(Loci::AMR_DB_REFINE_TAG) ;
+      if(Loci::MPI_rank == 0) {
+        cout << "INFO: FVMAMR found no cells marked for adaptation." << endl ;
+      }
+      return ;
+    }
+
+    entitySet dom = entitySet(seq) ;
+    fact_db::distribute_infoP dist =
+      Loci::exec_current_fact_db->get_distribute_info() ;
+    int offset = 0 ;
+    Loci::storeRepP vardist =
+      Loci::Local2FileOrder($cellRefineTag.Rep(),dom,offset,dist,
+                            MPI_COMM_WORLD) ;
+    Loci::replaceAMRDBItem(Loci::AMR_DB_REFINE_TAG,vardist) ;
+  } ;
+
+  //---------------------------------------------------------------------------
+  // Generic nodal and cell extrema helpers
+
+  $type X store<real> ;
+
+  $rule unit(nodalScalarMax(X)),constraint(pos) {
+    $nodalScalarMax(X) = std::numeric_limits<real>::lowest() ;
+  }
+
+  $rule apply(face2node->nodalScalarMax(X)<-(cl,cr)->X)[Loci::Maximum] {
+    const real Xf = max($cl->$X,$cr->$X) ;
+    const int fsz = $face2node.size() ;
+    for(int i=0;i<fsz;++i)
+      join($face2node[i]->$nodalScalarMax(X),realToFloat(Xf)) ;
+  }
+
+  $type X_f store<real> ;
+
+  $rule apply(face2node->nodalScalarMax(X)<-X_f)[Loci::Maximum],
+  constraint(ci->X) {
+    const real Xf = $X_f ;
+    const int fsz = $face2node.size() ;
+    for(int i=0;i<fsz;++i)
+      join($face2node[i]->$nodalScalarMax(X),realToFloat(Xf)) ;
+  }
+
+  $rule unit(nodalScalarMin(X)),constraint(pos) {
+    $nodalScalarMin(X) = std::numeric_limits<real>::max() ;
+  }
+
+  $rule apply(face2node->nodalScalarMin(X)<-(cl,cr)->X)[Loci::Minimum] {
+    const real Xf = min($cl->$X,$cr->$X) ;
+    const int fsz = $face2node.size() ;
+    for(int i=0;i<fsz;++i)
+      join($face2node[i]->$nodalScalarMin(X),realToFloat(Xf)) ;
+  }
+
+  $rule apply(face2node->nodalScalarMin(X)<-X_f)[Loci::Minimum],
+  constraint(ci->X) {
+    const real Xf = $X_f ;
+    const int fsz = $face2node.size() ;
+    for(int i=0;i<fsz;++i)
+      join($face2node[i]->$nodalScalarMin(X),realToFloat(Xf)) ;
+  }
+
+  template <class T> struct Maximumv3d {
+    void operator()(T &res,const T &arg)
+    {
+      res.x = ::max(res.x,arg.x) ;
+      res.y = ::max(res.y,arg.y) ;
+      res.z = ::max(res.z,arg.z) ;
+    }
+  } ;
+
+  template <class T> struct Minimumv3d {
+    void operator()(T &res,const T &arg)
+    {
+      res.x = ::min(res.x,arg.x) ;
+      res.y = ::min(res.y,arg.y) ;
+      res.z = ::min(res.z,arg.z) ;
+    }
+  } ;
+
+  $type V store<vect3d> ;
+
+  $rule unit(nodalv3dMax(V)),constraint(pos) {
+    real m = std::numeric_limits<real>::lowest() ;
+    $nodalv3dMax(V) = vector3d<real>(m,m,m) ;
+  }
+
+  $rule apply(face2node->nodalv3dMax(V)<-(cl,cr)->V)[Maximumv3d] {
+    const vector3d<real> Vf(realToFloat(max($cl->$V.x,$cr->$V.x)),
+                            realToFloat(max($cl->$V.y,$cr->$V.y)),
+                            realToFloat(max($cl->$V.z,$cr->$V.z))) ;
+    const int fsz = $face2node.size() ;
+    for(int i=0;i<fsz;++i)
+      join($face2node[i]->$nodalv3dMax(V),Vf) ;
+  }
+
+  $type V_f store<vect3d> ;
+
+  $rule apply(face2node->nodalv3dMax(V)<-V_f)[Maximumv3d],
+  constraint(ci->V) {
+    const vector3d<real> Vf = realToFloat($V_f) ;
+    const int fsz = $face2node.size() ;
+    for(int i=0;i<fsz;++i)
+      join($face2node[i]->$nodalv3dMax(V),Vf) ;
+  }
+
+  $rule unit(nodalv3dMin(V)),constraint(pos) {
+    real m = std::numeric_limits<real>::max() ;
+    $nodalv3dMin(V) = vector3d<real>(m,m,m) ;
+  }
+
+  $rule apply(face2node->nodalv3dMin(V)<-(cl,cr)->V)[Minimumv3d] {
+    const vector3d<real> Vf(realToFloat(min($cl->$V.x,$cr->$V.x)),
+                            realToFloat(min($cl->$V.y,$cr->$V.y)),
+                            realToFloat(min($cl->$V.z,$cr->$V.z))) ;
+    const int fsz = $face2node.size() ;
+    for(int i=0;i<fsz;++i)
+      join($face2node[i]->$nodalv3dMin(V),Vf) ;
+  }
+
+  $rule apply(face2node->nodalv3dMin(V)<-V_f)[Minimumv3d],
+  constraint(ci->V) {
+    const vector3d<real> Vf = realToFloat($V_f) ;
+    const int fsz = $face2node.size() ;
+    for(int i=0;i<fsz;++i)
+      join($face2node[i]->$nodalv3dMin(V),Vf) ;
+  }
+
+  $rule pointwise(cellMaxVal(X)<-(upper,lower)->face2node->nodalScalarMax(X)) {
+    real Xv = std::numeric_limits<real>::lowest() ;
+    const int usz = $upper.size() ;
+    for(int i=0;i<usz;++i) {
+      const int fsz = $upper[i]->$face2node.size() ;
+      for(int j=0;j<fsz;++j)
+        Xv = max(Xv,$upper[i]->$face2node[j]->$nodalScalarMax(X)) ;
+    }
+    const int lsz = $lower.size() ;
+    for(int i=0;i<lsz;++i) {
+      const int fsz = $lower[i]->$face2node.size() ;
+      for(int j=0;j<fsz;++j)
+        Xv = max(Xv,$lower[i]->$face2node[j]->$nodalScalarMax(X)) ;
+    }
+    $cellMaxVal(X) = Xv ;
+  }
+
+  $rule pointwise(cellMinVal(X)<-(upper,lower)->face2node->nodalScalarMin(X)) {
+    real Xv = std::numeric_limits<real>::max() ;
+    const int usz = $upper.size() ;
+    for(int i=0;i<usz;++i) {
+      const int fsz = $upper[i]->$face2node.size() ;
+      for(int j=0;j<fsz;++j)
+        Xv = min(Xv,$upper[i]->$face2node[j]->$nodalScalarMin(X)) ;
+    }
+    const int lsz = $lower.size() ;
+    for(int i=0;i<lsz;++i) {
+      const int fsz = $lower[i]->$face2node.size() ;
+      for(int j=0;j<fsz;++j)
+        Xv = min(Xv,$lower[i]->$face2node[j]->$nodalScalarMin(X)) ;
+    }
+    $cellMinVal(X) = Xv ;
+  }
+
+  $rule pointwise(cellMaxVal3d(V)<-(upper,lower)->face2node->nodalv3dMax(V)) {
+    real m = std::numeric_limits<real>::lowest() ;
+    vector3d<real> Xv(m,m,m) ;
+    const int usz = $upper.size() ;
+    for(int i=0;i<usz;++i) {
+      const int fsz = $upper[i]->$face2node.size() ;
+      for(int j=0;j<fsz;++j) {
+        Xv.x = max(Xv.x,$upper[i]->$face2node[j]->$nodalv3dMax(V).x) ;
+        Xv.y = max(Xv.y,$upper[i]->$face2node[j]->$nodalv3dMax(V).y) ;
+        Xv.z = max(Xv.z,$upper[i]->$face2node[j]->$nodalv3dMax(V).z) ;
+      }
+    }
+    const int lsz = $lower.size() ;
+    for(int i=0;i<lsz;++i) {
+      const int fsz = $lower[i]->$face2node.size() ;
+      for(int j=0;j<fsz;++j) {
+        Xv.x = max(Xv.x,$lower[i]->$face2node[j]->$nodalv3dMax(V).x) ;
+        Xv.y = max(Xv.y,$lower[i]->$face2node[j]->$nodalv3dMax(V).y) ;
+        Xv.z = max(Xv.z,$lower[i]->$face2node[j]->$nodalv3dMax(V).z) ;
+      }
+    }
+    $cellMaxVal3d(V) = Xv ;
+  }
+
+  $rule pointwise(cellMinVal3d(V)<-(upper,lower)->face2node->nodalv3dMin(V)) {
+    real m = std::numeric_limits<real>::max() ;
+    vector3d<real> Xv(m,m,m) ;
+    const int usz = $upper.size() ;
+    for(int i=0;i<usz;++i) {
+      const int fsz = $upper[i]->$face2node.size() ;
+      for(int j=0;j<fsz;++j) {
+        Xv.x = min(Xv.x,$upper[i]->$face2node[j]->$nodalv3dMin(V).x) ;
+        Xv.y = min(Xv.y,$upper[i]->$face2node[j]->$nodalv3dMin(V).y) ;
+        Xv.z = min(Xv.z,$upper[i]->$face2node[j]->$nodalv3dMin(V).z) ;
+      }
+    }
+    const int lsz = $lower.size() ;
+    for(int i=0;i<lsz;++i) {
+      const int fsz = $lower[i]->$face2node.size() ;
+      for(int j=0;j<fsz;++j) {
+        Xv.x = min(Xv.x,$lower[i]->$face2node[j]->$nodalv3dMin(V).x) ;
+        Xv.y = min(Xv.y,$lower[i]->$face2node[j]->$nodalv3dMin(V).y) ;
+        Xv.z = min(Xv.z,$lower[i]->$face2node[j]->$nodalv3dMin(V).z) ;
+      }
+    }
+    $cellMinVal3d(V) = Xv ;
+  }
+
+  $rule pointwise(cellMaxRadius<-cellcenter,(upper,lower)->face2node->pos) {
+    double rmax2 = 0 ;
+    const vect3d c = $cellcenter ;
+    const int usz = $upper.size() ;
+    for(int i=0;i<usz;++i) {
+      const int fsz = $upper[i]->$face2node.size() ;
+      for(int j=0;j<fsz;++j) {
+        const vect3d dv = $upper[i]->$face2node[j]->$pos-c ;
+        rmax2 = max(rmax2,realToDouble(dot(dv,dv))) ;
+      }
+    }
+    const int lsz = $lower.size() ;
+    for(int i=0;i<lsz;++i) {
+      const int fsz = $lower[i]->$face2node.size() ;
+      for(int j=0;j<fsz;++j) {
+        const vect3d dv = $lower[i]->$face2node[j]->$pos-c ;
+        rmax2 = max(rmax2,realToDouble(dot(dv,dv))) ;
+      }
+    }
+    $cellMaxRadius = sqrt(rmax2) ;
+  }
+
+  //---------------------------------------------------------------------------
+  // Generic face-difference error kernels
+
+  $type Y store<real> ;
+
+  $rule unit(cell_error_s(X,Y)),constraint(geom_cells) {
+    $cell_error_s(X,Y) = 0 ;
+  }
+
+  $rule apply((cl,cr)->cell_error_s(X,Y)<-X,Y)[Loci::Maximum],
+  constraint((cl,cr)->geom_cells,X,Y) {
+    real val = realToFloat(fabs($X-$Y)) ;
+    join($cl->$cell_error_s(X,Y),val) ;
+    join($cr->$cell_error_s(X,Y),val) ;
+  }
+
+  $type W store<vect3d> ;
+
+  $rule unit(cell_error_v3d(V,W)),constraint(geom_cells) {
+    $cell_error_v3d(V,W) = 0 ;
+  }
+
+  $rule apply((cl,cr)->cell_error_v3d(V,W)<-V,W)[Loci::Maximum],
+  constraint((cl,cr)->geom_cells,V,W) {
+    real val = realToFloat(norm($V-$W)) ;
+    join($cl->$cell_error_v3d(V,W),val) ;
+    join($cr->$cell_error_v3d(V,W),val) ;
+  }
+
+  $type VM storeVec<real> ;
+  $type WM storeVec<real> ;
+  $type N param<int> ;
+
+  $rule unit(cell_error_vM(VM,WM,N)),constraint(geom_cells) {
+    $cell_error_vM(VM,WM,N) = 0 ;
+  }
+
+  $rule apply((cl,cr)->cell_error_vM(VM,WM,N)<-VM,WM,N)[Loci::Maximum],
+  constraint((cl,cr)->geom_cells,VM,WM,N) {
+    real val = 0 ;
+    const int n = max($N,0) ;
+    for(int i=0;i<n;++i) {
+      const real dv = $VM[i]-$WM[i] ;
+      val += dv*dv ;
+    }
+    val = realToFloat(sqrt(realToDouble(val))) ;
+    join($cl->$cell_error_vM(VM,WM,N),val) ;
+    join($cr->$cell_error_vM(VM,WM,N),val) ;
+  }
+}

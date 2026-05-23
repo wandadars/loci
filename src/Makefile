@@ -27,9 +27,9 @@ include version.conf
 
 DEFINES = $(DEBUG) $(SYSTEM_DEFINES) $(MACHINE_SPECIFIC)
 
-.PHONEY: default library docs install lpp FVMtools FVMMod FVMAdapt FVMOverset
+.PHONEY: default library docs install lpp FVMtools FVMMod FVMAdapt FVMOverset FVMAMR
 .PHONEY: METIS SPRNG
-default: library lpp FVMtools FVMMod FVMAdapt FVMOverset METIS SPRNG
+default: library lpp FVMtools FVMMod FVMAdapt FVMOverset FVMAMR METIS SPRNG
 
 library: Tools/libTools.$(LIB_SUFFIX) System/libLoci.$(LIB_SUFFIX)
 
@@ -101,6 +101,9 @@ FVMAdapt: lpp FORCE
 FVMOverset: lpp FORCE
 	$(MAKE) -C FVMOverset LOCI_BASE="$(LOCI_BASE)" all
 
+FVMAMR: lpp FVMAdapt FORCE
+	$(MAKE) -C FVMAMR LOCI_BASE="$(LOCI_BASE)" all
+
 JUNK =
 
 .PHONY: test
@@ -124,6 +127,7 @@ endif
 	$(MAKE) -C FVMMod clean LOCI_BASE="$(LOCI_BASE)"
 	$(MAKE) -C FVMAdapt clean LOCI_BASE="$(LOCI_BASE)"
 	$(MAKE) -C FVMOverset clean LOCI_BASE="$(LOCI_BASE)"
+	$(MAKE) -C FVMAMR clean LOCI_BASE="$(LOCI_BASE)"
 	$(MAKE) -C quickTest clean LOCI_BASE="$(LOCI_BASE)"
 	$(MAKE) -C lpp clean LOCI_BASE="$(LOCI_BASE)"
 
@@ -148,6 +152,7 @@ endif
 	$(MAKE) -C FVMMod uninstall LOCI_BASE="$(LOCI_BASE)" LOCI_INSTALL_PATH="$(LOCI_INSTALL_PATH)"
 	$(MAKE) -C FVMAdapt uninstall LOCI_BASE="$(LOCI_BASE)" LOCI_INSTALL_PATH="$(LOCI_INSTALL_PATH)"
 	$(MAKE) -C FVMOverset uninstall LOCI_BASE="$(LOCI_BASE)" LOCI_INSTALL_PATH="$(LOCI_INSTALL_PATH)"
+	$(MAKE) -C FVMAMR uninstall LOCI_BASE="$(LOCI_BASE)" LOCI_INSTALL_PATH="$(LOCI_INSTALL_PATH)"
 	$(MAKE) -C FVMtools uninstall LOCI_BASE="$(LOCI_BASE)" LOCI_INSTALL_PATH="$(LOCI_INSTALL_PATH)"
 	$(MAKE) -C lpp uninstall LOCI_BASE="$(LOCI_BASE)" LOCI_INSTALL_PATH="$(LOCI_INSTALL_PATH)"
 	$(MAKE) -C System uninstall LOCI_BASE="$(LOCI_BASE)" LOCI_INSTALL_PATH="$(LOCI_INSTALL_PATH)"
@@ -168,6 +173,7 @@ endif
 	$(MAKE) -C FVMMod distclean LOCI_BASE="$(LOCI_BASE)"
 	$(MAKE) -C FVMAdapt distclean LOCI_BASE="$(LOCI_BASE)"
 	$(MAKE) -C FVMOverset distclean LOCI_BASE="$(LOCI_BASE)"
+	$(MAKE) -C FVMAMR distclean LOCI_BASE="$(LOCI_BASE)"
 	$(MAKE) -C quickTest distclean LOCI_BASE="$(LOCI_BASE)"
 	$(MAKE) -C FVMtools distclean LOCI_BASE="$(LOCI_BASE)"
 	$(MAKE) -C lpp distclean LOCI_BASE="$(LOCI_BASE)"

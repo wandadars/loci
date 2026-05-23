@@ -1,0 +1,121 @@
+//#############################################################################
+//#
+//# Copyright 2026, Mississippi State University
+//#
+//# This file is part of the Loci Framework.
+//#
+//# The Loci Framework is free software: you can redistribute it and/or modify
+//# it under the terms of the Lesser GNU General Public License as published by
+//# the Free Software Foundation, either version 3 of the License, or
+//# (at your option) any later version.
+//#
+//# The Loci Framework is distributed in the hope that it will be useful,
+//# but WITHOUT ANY WARRANTY; without even the implied warranty of
+//# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//# Lesser GNU General Public License for more details.
+//#
+//# You should have received a copy of the Lesser GNU General Public License
+//# along with the Loci Framework.  If not, see <http://www.gnu.org/licenses>
+//#
+//#############################################################################
+
+// Vars-file variables for mesh adaptation.
+
+/// Controls adaptation mode. Valid values are "isotropic", "anisotropic", and
+/// "2D".
+$type adaptMode param<std::string> ;
+
+/// Minimum edge length allowed for refinement.
+$type adaptMinEdgeLength param<double> ;
+
+/// Face folding criterion used by the FVMAdapt remesher.
+$type adaptFaceFold param<double> ;
+
+/// FVMAdapt balancing method used to balance refinement levels.
+$type adaptBalanceType param<int> ;
+
+/// Solver-provided cadence option for adaptation checks.
+$type adaptFrequency param<int> ;
+
+/// Solver-provided first cycle at which adaptation may start.
+$type adaptStart param<int> ;
+
+/// Error threshold for refinement.
+$type adaptSensitivity param<double> ;
+
+/// Error threshold for de-refinement.
+$type coarsenSensitivity param<double> ;
+
+/// Maximum number of adaptation steps to perform.
+$type maxAdaptSteps param<int> ;
+
+/// Maximum cell count during adaptation, in millions of cells. A negative
+/// value disables this limit.
+$type maxAdaptCellCount param<double> ;
+
+/// Comma-separated list of sensor names to use for adaptation.
+$type adaptSensor param<std::string> ;
+
+/// Per-sensor switch created from adaptSensor by application startup code.
+$type adaptSensor(X) param<bool> ;
+
+// Shared adaptation hooks and constraints.
+
+/// Solver-owned flag indicating that an adaptation cycle should run.
+$type do_adapt param<bool> ;
+
+/// Constraints for adaptation mode.
+$type adaptMode2D Constraint ;
+$type adaptMode3D Constraint ;
+
+/// Current adapted mesh level. Solvers that run in-memory AMR should maintain
+/// this fact between remesh cycles.
+$type refineLevel param<int> ;
+
+/// Parent-cell partition weighting hints for post-AMR repartitioning.
+$type cellPartitionWeights store<int> ;
+
+/// FVMAdapt-compatible cell tags: 0 keeps, 1 refines, 2 de-refines.
+$type cellRefineTag store<char> ;
+
+/// Number of cells whose exported AMR tag requests a mesh change.
+$type amrTagCount param<int> ;
+
+/// Constraint that is present only when at least one AMR tag requests change.
+$type adaptTagsActive Constraint ;
+
+// Generic tagging and sensor variables.
+
+$type refineCell(X) store<int> ;
+$type cellMaxEdgeLength store<Loci::real_t> ;
+$type cellAdaptMask store<int> ;
+$type cellMeanCount param<int> ;
+$type cellMean(X) param<double> ;
+$type cellSigmaSq(X) param<double> ;
+$type totScaledError store<Loci::real_t> ;
+$type limitedAdaptSensitivity blackbox<double> ;
+$type cellRefFlag store<int> ;
+$type cellRefFlagMask store<int> ;
+$type refCount param<int> ;
+$type derefCount param<int> ;
+
+/// Parametric scalar face-difference error kernel.
+$type cell_error_s(X,Y) store<Loci::real_t> ;
+
+/// Parametric vector face-difference error kernel.
+$type cell_error_v3d(V,W) store<Loci::real_t> ;
+
+/// Parametric variable-length vector face-difference error kernel.
+$type cell_error_vM(VM,WM,N) store<Loci::real_t> ;
+
+// Generic extrema helpers used by clipping and future region logic.
+
+$type nodalScalarMax(X) store<Loci::real_t> ;
+$type nodalScalarMin(X) store<Loci::real_t> ;
+$type nodalv3dMax(X) store<Loci::vector3d<Loci::real_t> > ;
+$type nodalv3dMin(X) store<Loci::vector3d<Loci::real_t> > ;
+$type cellMaxVal(X) store<Loci::real_t> ;
+$type cellMinVal(X) store<Loci::real_t> ;
+$type cellMaxVal3d(X) store<Loci::vector3d<Loci::real_t> > ;
+$type cellMinVal3d(X) store<Loci::vector3d<Loci::real_t> > ;
+$type cellMaxRadius store<Loci::real_t> ;

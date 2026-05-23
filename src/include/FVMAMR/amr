@@ -1,0 +1,181 @@
+//#############################################################################
+//#
+//# Copyright 2026, Mississippi State University
+//#
+//# This file is part of the Loci Framework.
+//#
+//# The Loci Framework is free software: you can redistribute it and/or modify
+//# it under the terms of the Lesser GNU General Public License as published by
+//# the Free Software Foundation, either version 3 of the License, or
+//# (at your option) any later version.
+//#
+//# The Loci Framework is distributed in the hope that it will be useful,
+//# but WITHOUT ANY WARRANTY; without even the implied warranty of
+//# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//# Lesser GNU General Public License for more details.
+//#
+//# You should have received a copy of the Lesser GNU General Public License
+//# along with the Loci Framework.  If not, see <http://www.gnu.org/licenses>
+//#
+//#############################################################################
+#ifndef FVMAMR_AMR_TYPES_H
+#define FVMAMR_AMR_TYPES_H
+
+#include <Loci.h>
+#include <FVMAdapt/dataxferDB.h>
+#include <FVMAdapt/globals.h>
+#include <FVMAdapt/gridInterface.h>
+#include <Tools/expr.h>
+#include <iostream>
+#include <string>
+
+namespace Loci {
+
+  enum AMRDBKey {
+    AMR_DB_ADAPT_CYCLE,
+    AMR_DB_REFINE_TAG,
+    AMR_DB_CELL_WEIGHTS,
+    AMR_DB_CURRENT_PLAN,
+    AMR_DB_NEXT_PLAN,
+    AMR_DB_C2P,
+    AMR_DB_C2P_GLOBAL,
+    AMR_DB_CELL_PARTITION_WEIGHTS,
+    AMR_DB_GRAD_CELLS,
+    AMR_DB_DELTAS,
+    AMR_DB_VOL
+  } ;
+
+  inline const char *amrDBKeyName(AMRDBKey key)
+  {
+    switch(key) {
+    case AMR_DB_ADAPT_CYCLE:            return "adaptCycle" ;
+    case AMR_DB_REFINE_TAG:             return "refineTag" ;
+    case AMR_DB_CELL_WEIGHTS:           return "cellweights" ;
+    case AMR_DB_CURRENT_PLAN:           return "currentPlan" ;
+    case AMR_DB_NEXT_PLAN:              return "nextPlan" ;
+    case AMR_DB_C2P:                    return "c2p" ;
+    case AMR_DB_C2P_GLOBAL:             return "c2pglobal" ;
+    case AMR_DB_CELL_PARTITION_WEIGHTS: return "cellPartitionWeights" ;
+    case AMR_DB_GRAD_CELLS:             return "gradCells" ;
+    case AMR_DB_DELTAS:                 return "deltas" ;
+    case AMR_DB_VOL:                    return "vol" ;
+    }
+    return "" ;
+  }
+
+  inline storeRepP getAMRDBItem(AMRDBKey key)
+  {
+    return DataXFER_DB.getItem(amrDBKeyName(key)) ;
+  }
+
+  inline bool hasAMRDBItem(AMRDBKey key)
+  {
+    return getAMRDBItem(key) != 0 ;
+  }
+
+  inline void replaceAMRDBItem(AMRDBKey key,storeRepP item)
+  {
+    DataXFER_DB.deleteItem(amrDBKeyName(key)) ;
+    DataXFER_DB.insertItem(amrDBKeyName(key),item) ;
+  }
+
+  inline void deleteAMRDBItem(AMRDBKey key)
+  {
+    DataXFER_DB.deleteItem(amrDBKeyName(key)) ;
+  }
+
+  inline void clearAMRParentChildKeys()
+  {
+    deleteAMRDBItem(AMR_DB_C2P) ;
+    deleteAMRDBItem(AMR_DB_C2P_GLOBAL) ;
+  }
+
+  inline bool hasAMRRefineTags()
+  {
+    return hasAMRDBItem(AMR_DB_REFINE_TAG) ;
+  }
+
+  inline int amrSplitModeFromAdaptMode(const std::string &mode)
+  {
+    if(mode == "2D")
+      return 1 ;
+    if(mode == "isotropic")
+      return 2 ;
+    return 0 ;
+  }
+
+  inline int configureFVMAdaptGlobals(fact_db &facts)
+  {
+    int adaptMode = 0 ;
+
+    storeRepP modePtr = facts.get_variable("adaptMode") ;
+    if(modePtr != 0) {
+      param<std::string> modeParam ;
+      modeParam = modePtr ;
+      adaptMode = amrSplitModeFromAdaptMode(*modeParam) ;
+    }
+
+    storeRepP edgePtr = facts.get_variable("adaptMinEdgeLength") ;
+    if(edgePtr != 0) {
+      param<double> adaptMinEdgeLength ;
+      adaptMinEdgeLength = edgePtr ;
+      Globals::tolerance = (*adaptMinEdgeLength)/10.0 ;
+    }
+
+    storeRepP faceFoldPtr = facts.get_variable("adaptFaceFold") ;
+    if(faceFoldPtr != 0) {
+      param<double> adaptFaceFold ;
+      adaptFaceFold = faceFoldPtr ;
+      Globals::fold = *adaptFaceFold ;
+    }
+
+    return adaptMode ;
+  }
+
+  inline void createAdaptSensorFact(fact_db &facts,const std::string &name)
+  {
+    const std::string switchVar =
+      std::string("adaptSensor(") + name + std::string(")") ;
+    if(facts.get_variable(switchVar) == 0) {
+      param<bool> adaptSwitch ;
+      *adaptSwitch = true ;
+      facts.create_fact(switchVar,adaptSwitch) ;
+    }
+  }
+
+  inline void setupAdaptSensorFacts(fact_db &facts)
+  {
+    storeRepP asensor = facts.get_variable("adaptSensor") ;
+    if(asensor == 0)
+      return ;
+
+    param<std::string> adaptSensor ;
+    adaptSensor = asensor ;
+    const std::string sensorList = *adaptSensor ;
+    if(sensorList == "")
+      return ;
+
+    exprP ep = expression::create(sensorList) ;
+    if(ep == 0) {
+      if(MPI_rank == 0)
+        std::cerr << "ERROR: Unable to interpret expression in 'adaptSensor'"
+                  << std::endl ;
+      Abort() ;
+    }
+
+    exprList sensors = collect_associative_op(ep,OP_COMMA) ;
+    for(exprList::const_iterator li=sensors.begin();li!=sensors.end();++li) {
+      if((*li)->op != OP_NAME) {
+        if(MPI_rank == 0) {
+          std::cerr << "ERROR: Unable to interpret expression in 'adaptSensor'"
+                    << std::endl ;
+          (*li)->Print(std::cerr) ;
+        }
+        Abort() ;
+      }
+      createAdaptSensorFact(facts,(*li)->name) ;
+    }
+  }
+}
+
+#endif
