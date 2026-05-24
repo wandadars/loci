@@ -290,6 +290,7 @@ namespace Loci {
     ************************************/
     // timing variables
     double dst1=0,det1=0,dst2=0,det2=0,cst=0,cet=0,schedst=0,schedet=0 ;
+    double cdst=0,cdet=0,ddst=0,ddet=0,ccst=0,ccet=0,asst=0,aset=0 ;
     dst1 = MPI_Wtime() ;
 
     // get all the recurrence information
@@ -378,8 +379,10 @@ namespace Loci {
       if(chomp_verbose)
         crv.summary(cout) ;
       
+      cdst = MPI_Wtime() ;
       dagCheckVisitor dagcV1(true) ;
       top_down_visit(dagcV1) ;
+      cdet = MPI_Wtime() ;
 
       // we set all chomped variables here
       all_chomped_vars = crv.get_all_chomped_vars() ;
@@ -507,8 +510,10 @@ namespace Loci {
 #endif
       
       // check if the decorated graphs are acyclic
+      ddst = MPI_Wtime() ;
       dagCheckVisitor dagcV(true) ;
       top_down_visit(dagcV) ;
+      ddet = MPI_Wtime() ;
 
 #ifdef COMPILE_PROGRESS
     if(Loci::MPI_rank==0)
@@ -615,8 +620,10 @@ namespace Loci {
       // and compilation of all other compilers
       // are done at below by graphSchedulerVisitor
       // and the assembleVisitor.
+      ccst = MPI_Wtime() ;
       compChompVisitor compchompv(reduceV.get_reduceInfo()) ;
       top_down_visit(compchompv) ;
+      ccet = MPI_Wtime() ;
 #ifdef COMPILE_PROGRESS
     if(Loci::MPI_rank==0)
       cerr << "[Graph Compile Phase] Passed Chomping Compilation!" << endl ;
@@ -707,9 +714,11 @@ namespace Loci {
 
     schedet = MPI_Wtime() ;
     
-  assembleVisitor av(reduceV.get_all_reduce_vars(),
-                     reduceV.get_reduceInfo()) ;
-  bottom_up_visit(av) ;
+    asst = MPI_Wtime() ;
+    assembleVisitor av(reduceV.get_all_reduce_vars(),
+                       reduceV.get_reduceInfo()) ;
+    bottom_up_visit(av) ;
+    aset = MPI_Wtime() ;
 
 
 
@@ -722,16 +731,30 @@ namespace Loci {
     exec_current_fact_db = &facts ;
 
     if(!in_internal_query)
-      if(use_dynamic_memory)
-        Loci::debugout << "Time taken for dmm graph decoration = "
-                       << (det1-dst1) + (det2-dst2) << " seconds " << endl ;
+      Loci::debugout << "Time taken for graph compile prepass = "
+                     << det1-dst1 << " seconds " << endl ;
     if(!in_internal_query)
-      if(use_chomp)
+      if(use_dynamic_memory) {
+        Loci::debugout << "Time taken for dmm graph decoration = "
+                       << det2-dst2 << " seconds " << endl ;
+        Loci::debugout << "Time taken for dmm graph cycle check = "
+                       << ddet-ddst << " seconds " << endl ;
+      }
+    if(!in_internal_query)
+      if(use_chomp) {
         Loci::debugout << "Time taken for chomping subgraph searching = "
                        << cet-cst << " seconds " << endl ;
+        Loci::debugout << "Time taken for chomping graph cycle check = "
+                       << cdet-cdst << " seconds " << endl ;
+        Loci::debugout << "Time taken for chomping compiler compile = "
+                       << ccet-ccst << " seconds " << endl ;
+      }
     if(!in_internal_query)
       Loci::debugout << "Time taken for graph scheduling = "
-                     << schedet-schedst << " sceonds " << endl ;
+                     << schedet-schedst << " seconds " << endl ;
+    if(!in_internal_query)
+      Loci::debugout << "Time taken for graph schedule assembly = "
+                     << aset-asst << " seconds " << endl ;
 #ifdef COMPILE_PROGRESS
     if(Loci::MPI_rank==0)
       cerr << "[Graph Compile Phase] Graph Compile Phase End!" << endl ;

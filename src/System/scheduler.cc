@@ -730,13 +730,24 @@ namespace Loci {
 
     
     stopWatch sw ;
+    stopWatch step_sw ;
+    double dependency_graph_time = 0 ;
+    double scheduler_init_time = 0 ;
+    double variable_type_time = 0 ;
+    double graph_decomposition_time = 0 ;
+    double initial_existence_time = 0 ;
+    double duplicate_model_time = 0 ;
+    double graph_compiler_construction_time = 0 ;
+    double graph_compile_time = 0 ;
     sw.start() ;
 	
     digraph gr ;
 
     given -= variable("EMPTY") ;
 
+    step_sw.start() ;
     gr = dependency_graph2(par_rdb,given,target).get_graph() ;
+    dependency_graph_time = step_sw.stop() ;
 
     // If graph is empty, return a null schedule
     if(gr.get_target_vertices() == EMPTY) {
@@ -764,10 +775,14 @@ namespace Loci {
     //prune_graph(gr,given,target,facts) ;
     ////////////////////
 
+    step_sw.start() ;
     scheds.init(facts) ;
+    scheduler_init_time = step_sw.stop() ;
     if(Loci::MPI_rank==0)
       cout << "setting up variable types..." << endl ;
+    step_sw.start() ;
     set_var_types(facts,gr,scheds) ;
+    variable_type_time = step_sw.stop() ;
 
     //////////////
     //scheds.print_summary(facts,cout) ;
@@ -775,7 +790,9 @@ namespace Loci {
 
     if(Loci::MPI_rank==0)
       cout << "decomposing graph..." << endl ;
+    step_sw.start() ;
     decomposed_graph decomp(gr,given,target) ;
+    graph_decomposition_time = step_sw.stop() ;
 
     //////////////////////////////////////////////////////////////////
     if(Loci::MPI_rank==0) {
@@ -794,6 +811,7 @@ namespace Loci {
 
     //////////////////////////////////////////////////////////////////
     variableSet fact_vars, initial_vars ;
+    step_sw.start() ;
     fact_vars = facts.get_typed_variables() ;
     for(variableSet::const_iterator vi=fact_vars.begin();vi!=fact_vars.end();++vi) {
       storeRepP vp = facts.get_variable(*vi) ;
@@ -828,9 +846,11 @@ namespace Loci {
 	}
       }
     }
+    initial_existence_time = step_sw.stop() ;
     Loci::debugout << " initial_vars = " << initial_vars << endl ;
 
     if(duplicate_work) {
+      step_sw.start() ;
 #ifdef DUPLICATE_DATA_FILE
       if(use_duplicate_model) {
 	std::ifstream fin(model_file);
@@ -874,10 +894,33 @@ namespace Loci {
 	}
       }
 #endif
+      duplicate_model_time = step_sw.stop() ;
     }
 
+    step_sw.start() ;
     graph_compiler compile_graph(decomp, initial_vars) ;
+    graph_compiler_construction_time = step_sw.stop() ;
+    step_sw.start() ;
     compile_graph.compile(facts,scheds,given,target) ;
+    graph_compile_time = step_sw.stop() ;
+
+    Loci::debugout << "Time taken for graph processing: dependency graph = "
+                   << dependency_graph_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for graph processing: scheduler database initialization = "
+                   << scheduler_init_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for graph processing: variable type setup = "
+                   << variable_type_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for graph processing: graph decomposition = "
+                   << graph_decomposition_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for graph processing: initial existence setup = "
+                   << initial_existence_time << " seconds " << endl ;
+    if(duplicate_work)
+      Loci::debugout << "Time taken for graph processing: duplicate model setup = "
+                     << duplicate_model_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for graph processing: compiler construction = "
+                   << graph_compiler_construction_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for graph processing: compiler compile = "
+                   << graph_compile_time << " seconds " << endl ;
 	
     Loci::debugout << "Time taken for graph processing  = "
                    << sw.stop() << "  seconds " << endl ;
@@ -2278,4 +2321,3 @@ bool operator <(const timingData &d) const {
   }
 
 } // end of namespace Loci
-
