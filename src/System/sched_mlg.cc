@@ -93,7 +93,11 @@ namespace Loci {
     
     FATAL(targets == EMPTY) ;
     ostringstream oss ;
-    oss << "source("<<sources << "),target(" << targets << ")," ;
+    // A source-less supernode has no dependencies; source() would parse as a
+    // blank variable and later fail scheduler lookup.
+    if(sources != EMPTY)
+      oss << "source(" << sources << ")," ;
+    oss << "target(" << targets << ")," ;
     if(cond != variable()) 
       oss<< "conditional(" << cond << ")," ;
     oss << "qualifier(SN" << super_node_number++ << ")" ;

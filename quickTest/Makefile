@@ -1,10 +1,10 @@
 TEST_BASE = $(shell pwd)
 
-.PHONY: FRC FVMModUnitTests FVMAdaptTest Containers Tools test default
+.PHONY: FRC FVMModUnitTests FVMAdaptTest ParametricRules Containers Tools test default
 
-default: FVM FVMModUnitTests FVMAdaptTest Containers Tools
-	cat Containers/TestResults Tools/TestResults FVMModUnitTests/TestResults FVM/TestResults > TestResults
-	rm Containers/TestResults Tools/TestResults FVMModUnitTests/TestResults FVM/TestResults
+default: FVM FVMModUnitTests FVMAdaptTest ParametricRules Containers Tools
+	cat Containers/TestResults Tools/TestResults ParametricRules/TestResults FVMModUnitTests/TestResults FVM/TestResults > TestResults
+	rm Containers/TestResults Tools/TestResults ParametricRules/TestResults FVMModUnitTests/TestResults FVM/TestResults
 	@grep PASS TestResults
 	@grep FAIL TestResults || true
 	@! grep -q FAIL TestResults
@@ -20,6 +20,9 @@ FVM: FRC
 FVMAdaptTest: FRC
 	$(MAKE) -C FVMAdaptTest LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE)
 
+ParametricRules: FRC
+	$(MAKE) -C ParametricRules TestResults LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE)
+
 Containers: FRC
 	$(MAKE) -C Containers LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE)
 
@@ -30,6 +33,7 @@ clean: FRC
 	rm -f TestResults
 	$(MAKE) -C FVM LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE) clean
 	$(MAKE) -C FVMModUnitTests LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE) clean
+	$(MAKE) -C ParametricRules LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE) clean
 	$(MAKE) -C Containers LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE) clean
 	$(MAKE) -C Tools LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE) clean
 	$(MAKE) -C FVMAdaptTest LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE) clean
@@ -38,6 +42,7 @@ distclean:
 	rm -f TestResults
 	$(MAKE) -C FVM LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE) distclean
 	$(MAKE) -C FVMModUnitTests LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE)  distclean
+	$(MAKE) -C ParametricRules LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE) distclean
 	$(MAKE) -C Containers LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE) distclean
 	$(MAKE) -C Tools LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE) distclean
 	$(MAKE) -C FVMAdaptTest LOCI_BASE=$(LOCI_BASE) TEST_BASE=$(TEST_BASE) distclean

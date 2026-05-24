@@ -1,0 +1,134 @@
+//#############################################################################
+//#
+//# Copyright 2008-2025, Mississippi State University
+//#
+//# This file is part of the Loci Framework.
+//#
+//# The Loci Framework is free software: you can redistribute it and/or modify
+//# it under the terms of the Lesser GNU General Public License as published by
+//# the Free Software Foundation, either version 3 of the License, or
+//# (at your option) any later version.
+//#
+//# The Loci Framework is distributed in the hope that it will be useful,
+//# but WITHOUT ANY WARRANTY; without even the implied warranty of
+//# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//# Lesser GNU General Public License for more details.
+//#
+//# You should have received a copy of the Lesser GNU General Public License
+//# along with the Loci Framework.  If not, see <http://www.gnu.org/licenses>
+//#
+//#############################################################################
+
+#include <Loci.h>
+#include <Tools/fpe.h>
+#include <iostream>
+
+using std::cout ;
+using std::cerr ;
+using std::endl ;
+
+$type splitLoopSeedA store<int> ;
+$type splitLoopSeedB store<int> ;
+$type splitLoopA store<int> ;
+$type splitLoopB store<int> ;
+$type splitLoopFinalA store<int> ;
+$type splitLoopFinalB store<int> ;
+$type splitLoopDoneA param<bool> ;
+$type splitLoopDoneB param<bool> ;
+$type splitLoopPartitionError param<int> ;
+$type splitLoopPartitionPassed param<bool> ;
+
+$rule pointwise(splitLoopA{splitIter=0}<-splitLoopSeedA) {
+  $splitLoopA{splitIter=0} = $splitLoopSeedA ;
+}
+
+$rule pointwise(splitLoopB{splitIter=0}<-splitLoopSeedB) {
+  $splitLoopB{splitIter=0} = $splitLoopSeedB ;
+}
+
+$rule pointwise(splitLoopA{splitIter+1}<-splitLoopA{splitIter}) {
+  $splitLoopA{splitIter+1} = $splitLoopA{splitIter}+1 ;
+}
+
+$rule pointwise(splitLoopB{splitIter+1}<-splitLoopB{splitIter}) {
+  $splitLoopB{splitIter+1} = $splitLoopB{splitIter}+1 ;
+}
+
+$rule singleton(splitLoopDoneA<-$splitIter) {
+  $splitLoopDoneA = $$splitIter >= 1 ;
+}
+
+$rule singleton(splitLoopDoneB<-$splitIter) {
+  $splitLoopDoneB = $$splitIter >= 2 ;
+}
+
+$rule pointwise(splitLoopFinalA<-splitLoopA{splitIter}),
+conditional(splitLoopDoneA{splitIter}) {
+  $splitLoopFinalA = $splitLoopA{splitIter} ;
+}
+
+$rule pointwise(splitLoopFinalB<-splitLoopB{splitIter}),
+conditional(splitLoopDoneB{splitIter}) {
+  $splitLoopFinalB = $splitLoopB{splitIter} ;
+}
+
+$rule unit(splitLoopPartitionError),constraint(UNIVERSE) {
+  $splitLoopPartitionError = 0 ;
+}
+
+$rule apply(splitLoopPartitionError<-splitLoopFinalA,splitLoopFinalB)
+[Loci::Maximum] {
+  int errA = $splitLoopFinalA - 1 ;
+  int errB = $splitLoopFinalB - 2 ;
+  join($splitLoopPartitionError,errA*errA + errB*errB) ;
+}
+
+$rule singleton(splitLoopPartitionPassed<-splitLoopPartitionError) {
+  $splitLoopPartitionPassed = ($splitLoopPartitionError == 0) ;
+  $[Once] {
+    if(!$splitLoopPartitionPassed) {
+      cerr << "unexpected split-loop error: "
+           << $splitLoopPartitionError << endl ;
+    }
+  }
+}
+
+int main(int ac, char *av[]) {
+  Loci::Init(&ac,&av) ;
+  set_fpe_abort() ;
+
+  rule_db rdb ;
+  rdb.add_rules(global_rule_list) ;
+
+  fact_db facts ;
+  entitySet splitLoopDomain = interval(0,0) ;
+  store<int> splitLoopSeedA ;
+  store<int> splitLoopSeedB ;
+  splitLoopSeedA.allocate(splitLoopDomain) ;
+  splitLoopSeedB.allocate(splitLoopDomain) ;
+  FORALL(splitLoopDomain,ii) {
+    splitLoopSeedA[ii] = 0 ;
+    splitLoopSeedB[ii] = 0 ;
+  } ENDFORALL ;
+  facts.create_fact("splitLoopSeedA",splitLoopSeedA) ;
+  facts.create_fact("splitLoopSeedB",splitLoopSeedB) ;
+
+  bool passed = false ;
+  if(!Loci::makeQuery(rdb,facts,"splitLoopPartitionPassed")) {
+    cerr << "query failed!" << endl ;
+  } else if(facts.get_fact("splitLoopPartitionPassed") != 0) {
+    param<bool> result ;
+    *result = false ;
+    result = facts.get_fact("splitLoopPartitionPassed") ;
+    passed = *result ;
+  }
+
+  Loci::Finalize() ;
+  if(passed) {
+    cout << "SUCCESS!" << endl ;
+    return 0 ;
+  }
+
+  cout << "FAILURE!" << endl ;
+  return 1 ;
+}
