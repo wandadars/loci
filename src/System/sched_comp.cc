@@ -1049,29 +1049,72 @@ namespace Loci {
   // bacause we don't need to issue internal queries for
   // these user_query facts if they happen to be relations also.
 #define RENUMBER
+  static void report_stationary_relation_timings(double dependency_graph_time,
+                                                 double relation_collection_time,
+                                                 double clone_setup_time,
+                                                 double internal_query_time,
+                                                 double rule_removal_time,
+                                                 double relation_restore_time,
+                                                 double empty_constraint_prune_time) {
+    Loci::debugout << "Time taken for stationary relation generation: dependency graph = "
+                   << dependency_graph_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for stationary relation generation: relation collection = "
+                   << relation_collection_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for stationary relation generation: clone setup = "
+                   << clone_setup_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for stationary relation generation: internal query = "
+                   << internal_query_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for stationary relation generation: rule removal = "
+                   << rule_removal_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for stationary relation generation: relation restore = "
+                   << relation_restore_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for stationary relation generation: empty constraint pruning = "
+                   << empty_constraint_prune_time << " seconds " << endl ;
+  }
+
   void stationary_relation_gen(rule_db& par_rdb,
                                fact_db& facts,
                                const variableSet& user_query) {
+    stopWatch step_sw ;
+    double dependency_graph_time = 0 ;
+    double relation_collection_time = 0 ;
+    double clone_setup_time = 0 ;
+    double internal_query_time = 0 ;
+    double rule_removal_time = 0 ;
+    double relation_restore_time = 0 ;
+    double empty_constraint_prune_time = 0 ;
+
     // we'll first generate the dependency graph
     // according to the initial facts and rules database
+    step_sw.start() ;
     variableSet given = facts.get_typed_variables() ;
     digraph gr ;
     given -= variable("EMPTY") ;
     gr = dependency_graph2(par_rdb,given,user_query).get_graph() ;
+    dependency_graph_time = step_sw.stop() ;
 
     //create_digraph_dot_file(gr,"dependgr.dot") ;
     //std::string cmd = "dotty dependgr.dot" ;
     //system(cmd.c_str()) ;
     
     // If graph is empty, we just return without any further actions
-    if(gr.get_target_vertices() == EMPTY)
+    if(gr.get_target_vertices() == EMPTY) {
+      report_stationary_relation_timings(dependency_graph_time,
+                                         relation_collection_time,
+                                         clone_setup_time,
+                                         internal_query_time,
+                                         rule_removal_time,
+                                         relation_restore_time,
+                                         empty_constraint_prune_time) ;
       return ;
+    }
 
     // we need to collect which relations are to be
     // generated in the stationary time level
     // but we'll need to query the relations according
     // to their topological order since the new
     // relations may change the existential analysis
+    step_sw.start() ;
     vector<digraph::vertexSet> order =
       component_sort(gr).get_components() ;
 
@@ -1135,8 +1178,16 @@ namespace Loci {
       if(step_relations != EMPTY)
         relations.push_back(make_pair(step_rules,step_relations)) ;
     }
+    relation_collection_time = step_sw.stop() ;
     // if we don't find any relation, we then quit.
     if(relations.empty()) {
+      report_stationary_relation_timings(dependency_graph_time,
+                                         relation_collection_time,
+                                         clone_setup_time,
+                                         internal_query_time,
+                                         rule_removal_time,
+                                         relation_restore_time,
+                                         empty_constraint_prune_time) ;
       return ;
     }
     // Okay we have gathered all the relations to be generated
@@ -1162,6 +1213,7 @@ namespace Loci {
         all_rules += vi->first ;
         all_queries += vi->second ;
       }
+      step_sw.start() ;
       fact_db clone(facts) ;
       // before each internal query, we need to
       // perform the global -> local renumbering
@@ -1178,16 +1230,22 @@ namespace Loci {
 #else
       Loci::serial_freeze(clone) ;
 #endif
+      clone_setup_time += step_sw.stop() ;
+      step_sw.start() ;
       if(!internalQuery(par_rdb, clone, all_queries)) {
         cerr << "Internal Query Failed, Aborting..." << endl ;
         Loci::Abort() ;
       }
+      internal_query_time += step_sw.stop() ;
       // then we remove in the rule database the rules
       // that generate the relations
+      step_sw.start() ;
       par_rdb.remove_rules(all_rules) ;
+      rule_removal_time += step_sw.stop() ;
       
       // Okay, now we need to put back the computed relations
       // to the original fact_db and restore the global numbering
+      step_sw.start() ;
 #ifdef RENUMBER
       if(clone.is_distributed_start()) {
         fact_db::distribute_infoP df = clone.get_distribute_info() ;
@@ -1229,9 +1287,11 @@ namespace Loci {
         facts.create_intensional_fact(*vi2,srp) ;
       }
 #endif      
+      relation_restore_time += step_sw.stop() ;
     }else { // if(has_map), then we need to make successive queries
       for(vector<pair<ruleSet,variableSet> >::const_iterator
             vi=relations.begin();vi!=relations.end();++vi) {
+        step_sw.start() ;
         fact_db clone(facts) ;
         // before each internal query, we need to
         // perform the global -> local renumbering
@@ -1248,19 +1308,25 @@ namespace Loci {
 #else
         Loci::serial_freeze(clone) ;
 #endif
+        clone_setup_time += step_sw.stop() ;
         // get the relations that we need to query
         ruleSet relationRules = vi->first ;
         variableSet queries = vi->second ;
+        step_sw.start() ;
         if(!internalQuery(par_rdb, clone, queries)) {
           cerr << "Internal Query Failed, Aborting..." << endl ;
           Loci::Abort() ;
         }
+        internal_query_time += step_sw.stop() ;
         // then we remove in the rule database the rules
         // that generate the relations
+        step_sw.start() ;
         par_rdb.remove_rules(relationRules) ;
+        rule_removal_time += step_sw.stop() ;
       
         // Okay, now we need to put back the computed relations
         // to the original fact_db and restore the global numbering
+        step_sw.start() ;
 #ifdef RENUMBER
         if(clone.is_distributed_start()) {
           fact_db::distribute_infoP df = clone.get_distribute_info() ;
@@ -1307,6 +1373,7 @@ namespace Loci {
           facts.create_intensional_fact(*vi2,srp) ;
         }
 #endif        
+        relation_restore_time += step_sw.stop() ;
       }
     } // end of if(!has_map)
     // finally we remove all the rules that derived from
@@ -1315,6 +1382,7 @@ namespace Loci {
 
     // Delete rules dependent on empty constraints if they are not super rules
     // that don't have the AND semantic
+    step_sw.start() ;
     ruleSet del_rules ;
     for(variableSet::const_iterator vi=empty_constraints.begin();
         vi!=empty_constraints.end();++vi) {
@@ -1330,8 +1398,16 @@ namespace Loci {
     }
     
     par_rdb.remove_rules(del_rules) ;
+    empty_constraint_prune_time = step_sw.stop() ;
 
     in_internal_query = false ;
+    report_stationary_relation_timings(dependency_graph_time,
+                                       relation_collection_time,
+                                       clone_setup_time,
+                                       internal_query_time,
+                                       rule_removal_time,
+                                       relation_restore_time,
+                                       empty_constraint_prune_time) ;
   }//end of stationary_map_gen
 
 

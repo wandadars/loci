@@ -692,17 +692,31 @@ namespace Loci {
                                      sched_db &scheds,
                                      const variableSet& target,
                                      int nth) {
+    stopWatch setup_sw ;
+    double parametric_rule_expansion_time = 0 ;
+    double map_constraint_replacement_time = 0 ;
+    double gpu_container_rename_time = 0 ;
+    double stationary_relation_time = 0 ;
+    double fact_distribution_setup_time = 0 ;
+
+    setup_sw.start() ;
     variableSet parVars = target ;
     parVars += facts.get_extensional_facts() ;
     rule_db par_rdb ;
     par_rdb = parametric_rdb(rdb,parVars) ;
+    parametric_rule_expansion_time = setup_sw.stop() ;
+
     // Not sure exactly why we need this, perhaps this is used by the
     // dynamic execution feature?  CHEM passes quicktest without
     // it.
+    setup_sw.start() ;
     par_rdb = replace_map_constraints(facts,par_rdb) ;
+    map_constraint_replacement_time = setup_sw.stop() ;
 
     // Rename gpu containers and insert
+    setup_sw.start() ;
     par_rdb = rename_gpu_containers(facts,par_rdb) ;
+    gpu_container_rename_time = setup_sw.stop() ;
     ////////////////decorate the dependency graph/////////////////////
     //if(Loci::MPI_rank==0)
     //cout << "decorating dependency graph to include allocation..." << endl ;
@@ -711,9 +725,12 @@ namespace Loci {
 #ifdef ENABLE_RELATION_GEN
     if(Loci::MPI_rank==0)
       cout << "Stationary Relation Generation..." << endl ;
+    setup_sw.start() ;
     stationary_relation_gen(par_rdb, facts, target) ;
+    stationary_relation_time = setup_sw.stop() ;
 #endif
     // then we need to perform global -> local renumbering
+    setup_sw.start() ;
     if(facts.is_distributed_start()) {
       if((MPI_processes > 1))
         get_clone(facts, par_rdb) ;
@@ -722,6 +739,20 @@ namespace Loci {
     } else {
       Loci::serial_freeze(facts) ;
     }
+    fact_distribution_setup_time = setup_sw.stop() ;
+
+    Loci::debugout << "Time taken for schedule setup: parametric rule expansion = "
+                   << parametric_rule_expansion_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for schedule setup: map constraint replacement = "
+                   << map_constraint_replacement_time << " seconds " << endl ;
+    Loci::debugout << "Time taken for schedule setup: gpu container rename = "
+                   << gpu_container_rename_time << " seconds " << endl ;
+#ifdef ENABLE_RELATION_GEN
+    Loci::debugout << "Time taken for schedule setup: stationary relation generation = "
+                   << stationary_relation_time << " seconds " << endl ;
+#endif
+    Loci::debugout << "Time taken for schedule setup: fact distribution setup = "
+                   << fact_distribution_setup_time << " seconds " << endl ;
 
     // then we can generate the dependency graph
     variableSet given = facts.get_typed_variables() ;
@@ -1670,6 +1701,11 @@ bool operator <(const timingData &d) const {
   bool internalQuery(rule_db& par_rdb, fact_db& facts,
                      const variableSet& query) {
     stopWatch sw ;
+    stopWatch step_sw ;
+    double fact_copy_time = 0 ;
+    double schedule_creation_time = 0 ;
+    double execution_time = 0 ;
+    double result_copy_time = 0 ;
     sw.start() ;
     
     if(MPI_rank == 0) {
@@ -1682,14 +1718,23 @@ bool operator <(const timingData &d) const {
     // start to make the query
     // This is because we want to only put the queried facts
     // back into the global fact_db
+    step_sw.start() ;
     fact_db local_facts(facts) ;
     sched_db local_scheds ;
+    fact_copy_time = step_sw.stop() ;
 
+    step_sw.start() ;
     executeP schedule =
       create_internal_execution_schedule(par_rdb,
                                          local_facts,local_scheds,query) ;
-    if(schedule == 0)
+    schedule_creation_time = step_sw.stop() ;
+    if(schedule == 0) {
+      debugout << "Time taken for internal query: fact db copy = "
+               << fact_copy_time << " seconds " << endl ;
+      debugout << "Time taken for internal query: schedule creation = "
+               << schedule_creation_time << " seconds " << endl ;
       return false ;
+    }
 
     // If a schedule was generated, execute it
 #ifdef INTERNAL_VERBOSE
@@ -1697,16 +1742,28 @@ bool operator <(const timingData &d) const {
       cout << "[Internal] begin query execution" << endl ;
 #endif
     exec_current_fact_db = &local_facts ;
+    step_sw.start() ;
     schedule->execute(local_facts, local_scheds) ;
+    execution_time = step_sw.stop() ;
 
+    step_sw.start() ;
     for(variableSet::const_iterator vi=query.begin();
         vi!=query.end();++vi) {
       storeRepP srp = local_facts.get_variable(*vi) ;
       facts.create_intensional_fact(*vi,srp) ;
     }
+    result_copy_time = step_sw.stop() ;
     double tlocal = sw.stop() ;
     double tglobal = 0 ;
     MPI_Allreduce(&tlocal,&tglobal, 1, MPI_DOUBLE, MPI_MAX,MPI_COMM_WORLD) ;
+    debugout << "Time taken for internal query: fact db copy = "
+             << fact_copy_time << " seconds " << endl ;
+    debugout << "Time taken for internal query: schedule creation = "
+             << schedule_creation_time << " seconds " << endl ;
+    debugout << "Time taken for internal query: execution = "
+             << execution_time << " seconds " << endl ;
+    debugout << "Time taken for internal query: result copy = "
+             << result_copy_time << " seconds " << endl ;
     debugout << "time to execute internal query " << tglobal <<endl;
 
     return true ;
