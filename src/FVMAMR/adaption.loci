@@ -50,6 +50,8 @@ namespace Loci {
   /// adaptMode can be "isotropic", "anisotropic", or "2D".
   $rule default(adaptMode) { $adaptMode = "anisotropic" ; }
 
+  /// Only the literal "2D" selects the planar edge-length guard. All other
+  /// modes use the 3D geometry path; the split behavior is handled by FVMAdapt.
   $rule constraint(adaptMode2D,adaptMode3D<-adaptMode) {
     $adaptMode2D = EMPTY ;
     $adaptMode3D = EMPTY ;
@@ -98,6 +100,7 @@ namespace Loci {
     $cellPartitionWeights = 1 ;
   }
 
+  /// Maximum number of cells allowed to request refinement in this query.
   $type maxRefineCellCount param<int> ;
 
   /// Estimate how many cells may be refined before reaching maxAdaptCellCount.
@@ -121,10 +124,13 @@ namespace Loci {
   //---------------------------------------------------------------------------
   // Cell-based adaptation flags
 
+  /// Edge-length estimate used as a refinement guard. This is not a full mesh
+  /// quality metric; it only protects cells already below adaptMinEdgeLength.
   $rule unit(cellMaxEdgeLength),constraint(geom_cells) {
     $cellMaxEdgeLength = 0 ;
   }
 
+  /// Estimate cell edge length from 3D face geometry.
   $rule apply((cl,cr)->cellMaxEdgeLength<-area,face2node->pos)[Loci::Maximum],
   constraint(adaptMode3D,(cl,cr)->geom_cells) {
     real len = 0 ;
@@ -141,6 +147,7 @@ namespace Loci {
     join($cr->$cellMaxEdgeLength,estlen) ;
   }
 
+  /// In 2D mode, only faces normal to the z direction contribute to the guard.
   $rule apply(ci->cellMaxEdgeLength<-area,face2node->pos)[Loci::Maximum],
   constraint(adaptMode2D,ci->geom_cells) {
     if(fabs(fabs($area.n.z)-1.0) < 1e-8) {
@@ -175,6 +182,8 @@ namespace Loci {
   //---------------------------------------------------------------------------
   // Sensor normalization and thresholding
 
+  /// Sensor statistics are global scalar normalizers. Solver modules provide
+  /// the sensor fields; FVMAMR computes the mean and variance used for thresholding.
   $rule unit(cellMeanCount),constraint(geom_cells) {
     $cellMeanCount = 0 ;
   }
@@ -207,6 +216,8 @@ namespace Loci {
 
   $type ERRVAR store<real> ;
 
+  /// Start with no sensor contribution. With no selected sensors, AMR marking is
+  /// a no-op unless a solver adds its own cellRefFlag contributors.
   $rule unit(totScaledError),constraint(geom_cells) {
     $totScaledError = 0 ;
   }
@@ -292,6 +303,8 @@ namespace Loci {
     $cellRefFlag = 0 ;
   }
 
+  /// Convert the normalized sensor value into a signed AMR request. If multiple
+  /// rules contribute to cellRefFlag, refinement takes precedence.
   $rule apply(cellRefFlag<-totScaledError,limitedAdaptSensitivity,
   coarsenSensitivity)[AMRFlagCombine] {
     int flag = 0 ;
@@ -304,12 +317,14 @@ namespace Loci {
     join($cellRefFlag,flag) ;
   }
 
+  /// Apply geometric protection masks without suppressing de-refinement.
   $rule pointwise(cellRefFlagMask<-cellAdaptMask,cellRefFlag) {
     $cellRefFlagMask = $cellRefFlag ;
     if($cellRefFlag > 0 && $cellAdaptMask != 0)
       $cellRefFlagMask = 0 ;
   }
 
+  /// Count positive refinement requests after masking.
   $rule unit(refCount),constraint(UNIVERSE) {
     $refCount = 0 ;
   }
@@ -319,6 +334,7 @@ namespace Loci {
     join($refCount,cnt) ;
   }
 
+  /// Count de-refinement requests after masking.
   $rule unit(derefCount),constraint(UNIVERSE) {
     $derefCount = 0 ;
   }
@@ -337,6 +353,7 @@ namespace Loci {
   //---------------------------------------------------------------------------
   // FVMAdapt database staging
 
+  /// Translate FVMAMR's signed marker to the unsigned FVMAdapt tag encoding.
   $rule pointwise(cellRefineTag<-cellRefFlagMask) {
     if($cellRefFlagMask > 0) {
       $cellRefineTag = 1 ;
@@ -347,6 +364,7 @@ namespace Loci {
     }
   }
 
+  /// Count nonzero tags so a no-op marking pass does not trigger remeshing.
   $rule unit(amrTagCount),constraint(UNIVERSE) {
     $amrTagCount = 0 ;
   }
@@ -356,6 +374,7 @@ namespace Loci {
     join($amrTagCount,cnt) ;
   }
 
+  /// Stage partition weights in file order for FVMAdapt's repartitioning path.
   $rule pointwise(OUTPUT<-cellPartitionWeights),conditional(do_adapt),
   constraint(geom_cells),option(disable_threading),prelude {
     entitySet dom = entitySet(seq) ;
@@ -368,6 +387,8 @@ namespace Loci {
     Loci::replaceAMRDBItem(Loci::AMR_DB_CELL_PARTITION_WEIGHTS,vardist) ;
   } ;
 
+  /// Stage refinement tags in file order. Parent-child maps are cleared here
+  /// because they belong to the previous adapted mesh once new tags are issued.
   $rule pointwise(OUTPUT<-cellRefineTag,amrTagCount),conditional(do_adapt),
   constraint(geom_cells),option(disable_threading),prelude {
     Loci::clearAMRParentChildKeys() ;
@@ -395,6 +416,7 @@ namespace Loci {
 
   $type X store<real> ;
 
+  /// Scatter cell or face scalar maxima to surrounding nodes.
   $rule unit(nodalScalarMax(X)),constraint(pos) {
     $nodalScalarMax(X) = std::numeric_limits<real>::lowest() ;
   }
@@ -416,6 +438,7 @@ namespace Loci {
       join($face2node[i]->$nodalScalarMax(X),realToFloat(Xf)) ;
   }
 
+  /// Scatter cell or face scalar minima to surrounding nodes.
   $rule unit(nodalScalarMin(X)),constraint(pos) {
     $nodalScalarMin(X) = std::numeric_limits<real>::max() ;
   }
@@ -455,6 +478,7 @@ namespace Loci {
 
   $type V store<vect3d> ;
 
+  /// Scatter vector-component maxima to surrounding nodes.
   $rule unit(nodalv3dMax(V)),constraint(pos) {
     real m = std::numeric_limits<real>::lowest() ;
     $nodalv3dMax(V) = vector3d<real>(m,m,m) ;
@@ -479,6 +503,7 @@ namespace Loci {
       join($face2node[i]->$nodalv3dMax(V),Vf) ;
   }
 
+  /// Scatter vector-component minima to surrounding nodes.
   $rule unit(nodalv3dMin(V)),constraint(pos) {
     real m = std::numeric_limits<real>::max() ;
     $nodalv3dMin(V) = vector3d<real>(m,m,m) ;
@@ -583,6 +608,7 @@ namespace Loci {
     $cellMinVal3d(V) = Xv ;
   }
 
+  /// Geometric cell scale from the center to surrounding face nodes.
   $rule pointwise(cellMaxRadius<-cellcenter,(upper,lower)->face2node->pos) {
     double rmax2 = 0 ;
     const vect3d c = $cellcenter ;
@@ -610,6 +636,7 @@ namespace Loci {
 
   $type Y store<real> ;
 
+  /// Maximum scalar jump across adjacent cells.
   $rule unit(cell_error_s(X,Y)),constraint(geom_cells) {
     $cell_error_s(X,Y) = 0 ;
   }
@@ -623,6 +650,7 @@ namespace Loci {
 
   $type W store<vect3d> ;
 
+  /// Maximum vector jump magnitude across adjacent cells.
   $rule unit(cell_error_v3d(V,W)),constraint(geom_cells) {
     $cell_error_v3d(V,W) = 0 ;
   }
@@ -638,6 +666,7 @@ namespace Loci {
   $type WM storeVec<real> ;
   $type N param<int> ;
 
+  /// Maximum variable-length vector jump magnitude across adjacent cells.
   $rule unit(cell_error_vM(VM,WM,N)),constraint(geom_cells) {
     $cell_error_vM(VM,WM,N) = 0 ;
   }

@@ -1,0 +1,81 @@
+//#############################################################################
+//#
+//# Copyright 2026, Mississippi State University
+//#
+//# This file is part of the Loci Framework.
+//#
+//# The Loci Framework is free software: you can redistribute it and/or modify
+//# it under the terms of the Lesser GNU General Public License as published by
+//# the Free Software Foundation, either version 3 of the License, or
+//# (at your option) any later version.
+//#
+//# The Loci Framework is distributed in the hope that it will be useful,
+//# but WITHOUT ANY WARRANTY; without even the implied warranty of
+//# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//# Lesser GNU General Public License for more details.
+//#
+//# You should have received a copy of the Lesser GNU General Public License
+//# along with the Loci Framework.  If not, see <http://www.gnu.org/licenses>
+//#
+//#############################################################################
+#include <Loci.h>
+#include <FVMAMR/amr.h>
+#include <FVMAdapt/defines.h>
+#include <string>
+
+$include "FVM.lh"
+$include "FVMAMR/amr.lh"
+
+namespace Loci {
+
+  using std::cerr ;
+  using std::endl ;
+
+  /// Activate parent-to-child interpolation only for adapted continuation. The
+  /// driver owns refineRestart and sets it after replacing the grid in memory.
+  $rule constraint(amr_restart<-refineRestart) {
+    if($refineRestart > 0) {
+      $amr_restart = ~EMPTY ;
+    } else {
+      $amr_restart = EMPTY ;
+    }
+  }
+
+  $type AMRInterpolationMapping blackbox<Loci::AMRinterpolation> ;
+
+  /// Build the interpolation map from the geometric stencil staged before
+  /// remeshing and the parent-child map created by FVMAdapt.
+  $rule blackbox(AMRInterpolationMapping<-refineRestart,cellcenter,vol),
+    constraint(amr_restart,geom_cells),prelude {
+    storeRepP gp = getAMRDBItem(AMR_DB_GRAD_CELLS) ;
+    storeRepP dp = getAMRDBItem(AMR_DB_DELTAS) ;
+    storeRepP vp = getAMRDBItem(AMR_DB_VOL) ;
+    if(gp == 0 || dp == 0 || vp == 0) {
+      cerr << "ERROR: AMR interpolation metadata not found in DataXFER_DB."
+           << endl ;
+      Abort() ;
+    }
+
+    multiStore<int> gradCells ;
+    multiStore<vector3d<double> > deltas ;
+    store<double> volw ;
+    store<pair<int,int> > c2pg ;
+
+    gradCells = gp ;
+    deltas = dp ;
+    volw = vp ;
+    c2pg = getC2PGlobal(*exec_current_fact_db) ;
+
+    $AMRInterpolationMapping->setupRefinementMapping(c2pg,volw,gradCells,
+                                                     deltas,$cellcenter,$vol,
+                                                     *exec_current_fact_db) ;
+
+    volw.allocate(EMPTY) ;
+    gradCells.allocate(EMPTY) ;
+    deltas.allocate(EMPTY) ;
+    deleteAMRDBItem(AMR_DB_VOL) ;
+    deleteAMRDBItem(AMR_DB_GRAD_CELLS) ;
+    deleteAMRDBItem(AMR_DB_DELTAS) ;
+    deleteAMRDBItem(AMR_DB_CENTERS) ;
+  } ;
+}

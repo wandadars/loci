@@ -1,0 +1,103 @@
+//#############################################################################
+//#
+//# Copyright 2026, Mississippi State University
+//#
+//# This file is part of the Loci Framework.
+//#
+//# The Loci Framework is free software: you can redistribute it and/or modify
+//# it under the terms of the Lesser GNU General Public License as published by
+//# the Free Software Foundation, either version 3 of the License, or
+//# (at your option) any later version.
+//#
+//# The Loci Framework is distributed in the hope that it will be useful,
+//# but WITHOUT ANY WARRANTY; without even the implied warranty of
+//# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//# Lesser GNU General Public License for more details.
+//#
+//# You should have received a copy of the Lesser GNU General Public License
+//# along with the Loci Framework.  If not, see <http://www.gnu.org/licenses>
+//#
+//#############################################################################
+#include <Loci.h>
+#include <FVMAMR/amr.h>
+#include <algorithm>
+#include <limits>
+#include <vector>
+
+$include "FVM.lh"
+$include "FVMAMR/amr.lh"
+
+namespace Loci {
+
+  using std::min ;
+  using std::vector ;
+
+  /// Stage the FVM geometric stencil used by AMRInterpolationMapping. Neighbor
+  /// entries are written with file-order cell numbers, while the stores
+  /// themselves are redistributed into the same file-order partitioning.
+  $rule pointwise(OUTPUT<-(upper,lower,boundary_map)->facecenter,
+                  lower->cl->fileNumber(geom_cells),
+                  upper->cr->fileNumber(geom_cells),
+                  cellcenter,vol),
+    constraint(geom_cells),conditional(do_adapt),
+    option(disable_threading),prelude {
+    entitySet dom = entitySet(seq) ;
+
+    store<int> count_dv ;
+    store<int> count_iv ;
+    count_dv.allocate(dom) ;
+    count_iv.allocate(dom) ;
+    FORALL(dom,ii) {
+      count_iv[ii] = $upper[ii].size()+$lower[ii].size() ;
+      count_dv[ii] = count_iv[ii] + $boundary_map[ii].size() ;
+    } ENDFORALL ;
+
+    int mn = 0 ;
+    int mnl = std::numeric_limits<int>::max() ;
+    FORALL(dom,ii) {
+      mnl = min(mnl,$fileNumber(geom_cells)[ii]) ;
+    } ENDFORALL ;
+    MPI_Allreduce(&mnl,&mn,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD) ;
+
+    multiStore<int> gradCells ;
+    multiStore<vector3d<double> > deltas ;
+    gradCells.allocate(count_iv) ;
+    deltas.allocate(count_dv) ;
+    FORALL(dom,ii) {
+      vect3d center = $cellcenter[ii] ;
+      const int usz = $upper[ii].size() ;
+      for(int i=0;i<usz;++i) {
+        const int cell = $cr[$upper[ii][i]] ;
+        gradCells[ii][i] = $fileNumber(geom_cells)[cell]-mn ;
+        deltas[ii][i] = ($cellcenter[cell]-center) ;
+      }
+      const int lsz = $lower[ii].size() ;
+      for(int i=0;i<lsz;++i) {
+        const int cell = $cl[$lower[ii][i]] ;
+        gradCells[ii][usz+i] = $fileNumber(geom_cells)[cell]-mn ;
+        deltas[ii][usz+i] = ($cellcenter[cell]-center) ;
+      }
+      const int bsz = $boundary_map[ii].size() ;
+      for(int i=0;i<bsz;++i) {
+        const int face = $boundary_map[ii][i] ;
+        deltas[ii][usz+lsz+i] = ($facecenter[face]-center) ;
+      }
+    } ENDFORALL ;
+
+    fact_db::distribute_infoP dist =
+      Loci::exec_current_fact_db->get_distribute_info() ;
+    replaceAMRDBItem(AMR_DB_GRAD_CELLS,
+                     redistributeAMRStoreToFileOrder(gradCells.Rep(),
+                                                     dom,dist)) ;
+    replaceAMRDBItem(AMR_DB_DELTAS,
+                     redistributeAMRStoreToFileOrder(deltas.Rep(),dom,dist)) ;
+
+    store<double> volw ;
+    volw.allocate(dom) ;
+    FORALL(dom,ii) {
+      volw[ii] = $vol[ii] ;
+    } ENDFORALL ;
+    replaceAMRDBItem(AMR_DB_VOL,
+                     redistributeAMRStoreToFileOrder(volw.Rep(),dom,dist)) ;
+  } ;
+}

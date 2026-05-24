@@ -61,10 +61,10 @@ $type adaptSensor(X) param<bool> ;
 
 // Shared adaptation hooks and constraints.
 
-/// Solver-owned flag indicating that an adaptation cycle should run.
+/// Solver-owned flag indicating that this query should stage AMR data.
 $type do_adapt param<bool> ;
 
-/// Constraints for adaptation mode.
+/// Constraints selecting the edge-length rules used by the generic marker.
 $type adaptMode2D Constraint ;
 $type adaptMode3D Constraint ;
 
@@ -72,7 +72,15 @@ $type adaptMode3D Constraint ;
 /// this fact between remesh cycles.
 $type refineLevel param<int> ;
 
-/// Parent-cell partition weighting hints for post-AMR repartitioning.
+/// Driver-provided flag for adapted continuation. A positive value activates
+/// parent-to-child interpolation from data staged before remeshing.
+$type refineRestart param<int> ;
+
+/// Constraint present during adapted continuation/restart interpolation.
+$type amr_restart Constraint ;
+
+/// Parent-cell partition weighting hints for post-AMR repartitioning. The module
+/// supplies uniform weights unless the solver provides a more specific rule.
 $type cellPartitionWeights store<int> ;
 
 /// FVMAdapt-compatible cell tags: 0 keeps, 1 refines, 2 de-refines.
@@ -86,17 +94,42 @@ $type adaptTagsActive Constraint ;
 
 // Generic tagging and sensor variables.
 
+/// Optional per-sensor integer marker hook. Solvers may use this for their own
+/// tagging diagnostics or compose it into cellRefFlag with additional rules.
 $type refineCell(X) store<int> ;
+
+/// Largest local edge-length estimate used to protect already-small cells.
 $type cellMaxEdgeLength store<Loci::real_t> ;
+
+/// Refinement protection mask. A nonzero value suppresses positive refinement
+/// requests for that cell.
 $type cellAdaptMask store<int> ;
+
+/// Number of cells contributing to scalar sensor statistics.
 $type cellMeanCount param<int> ;
+
+/// Global mean of a solver-provided scalar sensor field.
 $type cellMean(X) param<double> ;
+
+/// Global sample variance of a solver-provided scalar sensor field.
 $type cellSigmaSq(X) param<double> ;
+
+/// Combined normalized sensor value used by the default threshold marker.
 $type totScaledError store<Loci::real_t> ;
+
+/// Effective refinement threshold after applying the maximum-cell-count cap.
 $type limitedAdaptSensitivity blackbox<double> ;
+
+/// Signed local AMR request: 1 refines, -1 de-refines, and 0 leaves unchanged.
 $type cellRefFlag store<int> ;
+
+/// Signed AMR request after applying geometric protection masks.
 $type cellRefFlagMask store<int> ;
+
+/// Number of cells requesting refinement.
 $type refCount param<int> ;
+
+/// Number of cells requesting de-refinement.
 $type derefCount param<int> ;
 
 /// Parametric scalar face-difference error kernel.
@@ -108,7 +141,9 @@ $type cell_error_v3d(V,W) store<Loci::real_t> ;
 /// Parametric variable-length vector face-difference error kernel.
 $type cell_error_vM(VM,WM,N) store<Loci::real_t> ;
 
-// Generic extrema helpers used by clipping and future region logic.
+// Generic extrema helpers used by clipping and future region logic. Nodal
+// extrema are scatter targets; cell extrema collect values over the surrounding
+// face nodes.
 
 $type nodalScalarMax(X) store<Loci::real_t> ;
 $type nodalScalarMin(X) store<Loci::real_t> ;
@@ -118,4 +153,6 @@ $type cellMaxVal(X) store<Loci::real_t> ;
 $type cellMinVal(X) store<Loci::real_t> ;
 $type cellMaxVal3d(X) store<Loci::vector3d<Loci::real_t> > ;
 $type cellMinVal3d(X) store<Loci::vector3d<Loci::real_t> > ;
+
+/// Maximum distance from cell center to surrounding face nodes.
 $type cellMaxRadius store<Loci::real_t> ;

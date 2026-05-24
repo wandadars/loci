@@ -38,6 +38,8 @@ This branch adds:
 
 - `src/FVMAMR/Makefile`
 - `src/FVMAMR/adaption.loci`
+- `src/FVMAMR/transfer.loci`
+- `src/FVMAMR/restart.loci`
 - `src/include/FVMAMR/amr`
 - `src/include/FVMAMR/amr.h`
 - `src/include/FVMAMR/amr.lh`
@@ -48,10 +50,11 @@ The module name is `fvmamr`, so solvers should be able to load:
 Loci::load_module("fvmamr", rdb) ;
 ```
 
-The initial module intentionally does not own solver cadence, output/restart
-payloads, or field-specific sensors. It provides common adaptation variables,
-rules that compute `cellRefFlagMask` from mesh geometry plus solver-provided
-generic sensors, and the database staging needed by `FVMAdapt`.
+The initial module intentionally does not own solver cadence, field lists, or
+field-specific sensors. It provides common adaptation variables, rules that
+compute `cellRefFlagMask` from FVM geometry plus solver-provided generic
+sensors, the database staging needed by `FVMAdapt`, and transfer/restart rule
+classes that solvers instantiate with their own variable names.
 
 ## Minimal Solver Interface
 
@@ -86,6 +89,8 @@ A code that wants to use the module should:
    - `refineTag`, using the `FVMAdapt` encoding `0=keep`, `1=refine`,
      `2=de-refine`
    - stale parent/child map cleanup for `c2p` and `c2pglobal`
+   - interpolation metadata (`gradCells`, `deltas`, `vol`) required by
+     `Loci::AMRinterpolation`
 
 5. In the driver outer loop, read the staged tag through the public helper:
 
@@ -98,7 +103,11 @@ A code that wants to use the module should:
    ```
 
    The solver still owns adapted-grid injection, restart/time-loop collapse,
-   and field transfer registrations.
+   and field transfer/restart registrations.
+
+6. Register state fields that must survive adapted continuation with the generic
+   transfer/restart rule classes. The module does not infer solver time levels,
+   restart variable names, or physics constraints.
 
 With no selected sensors and no solver-provided marking rules, the module is a
 safe no-op: `cellRefFlag` defaults to 0, `refineTag` is not staged, and
@@ -123,8 +132,8 @@ Own in `FVMAMR`:
 - stale-key cleanup and validation
 - no-op tag guards
 - adapt-level/current-plan state helpers
-- optional transfer/restart templates that solvers instantiate with their own
-  field names
+- transfer/restart templates that solvers instantiate with their own field
+  names, time levels, DB keys, and constraints
 
 Keep in each solver:
 
@@ -140,9 +149,8 @@ Keep in each solver:
    sensor, queries `cellRefFlagMask`, and does not run remeshing.
 2. Add a driver-side guard/helper that scans an existing `refineTag` store for
    all-zero content before calling `onlineRefineMesh()`.
-3. Move reusable transfer/restart templates from Loci-Stream after separating
-   generic scalar/vector/storeVec interpolation from Stream's field names and
-   time levels.
+3. Add compact examples showing scalar, vector, and storeVec transfer/restart
+   registration from a solver module.
 4. Add optional overset-aware tagging as a separate rule file, because it
    depends on `FVMOverset` variables such as `componentGeometryList`,
    `componentID`, and `iblank`.

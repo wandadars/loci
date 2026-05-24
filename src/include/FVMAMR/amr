@@ -28,9 +28,13 @@
 #include <Tools/expr.h>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace Loci {
 
+  /// Typed names for the legacy FVMAdapt DataXFER_DB entries used during
+  /// in-memory adaptation. These wrappers document the string contract without
+  /// moving ownership of remeshing data out of FVMAdapt.
   enum AMRDBKey {
     AMR_DB_ADAPT_CYCLE,
     AMR_DB_REFINE_TAG,
@@ -42,9 +46,11 @@ namespace Loci {
     AMR_DB_CELL_PARTITION_WEIGHTS,
     AMR_DB_GRAD_CELLS,
     AMR_DB_DELTAS,
-    AMR_DB_VOL
+    AMR_DB_VOL,
+    AMR_DB_CENTERS
   } ;
 
+  /// Return the DataXFER_DB key string associated with a typed AMR key.
   inline const char *amrDBKeyName(AMRDBKey key)
   {
     switch(key) {
@@ -59,42 +65,77 @@ namespace Loci {
     case AMR_DB_GRAD_CELLS:             return "gradCells" ;
     case AMR_DB_DELTAS:                 return "deltas" ;
     case AMR_DB_VOL:                    return "vol" ;
+    case AMR_DB_CENTERS:                return "centers" ;
     }
     return "" ;
   }
 
-  inline storeRepP getAMRDBItem(AMRDBKey key)
+  /// Fetch a DataXFER_DB item by raw key name. Prefer the enum overload when
+  /// the key is part of the common FVMAMR/FVMAdapt contract.
+  inline storeRepP getAMRDBItem(const std::string &keyName)
   {
-    return DataXFER_DB.getItem(amrDBKeyName(key)) ;
+    return DataXFER_DB.getItem(keyName) ;
   }
 
+  /// Fetch a common AMR DataXFER_DB item by typed key.
+  inline storeRepP getAMRDBItem(AMRDBKey key)
+  {
+    return getAMRDBItem(amrDBKeyName(key)) ;
+  }
+
+  /// Test whether a raw DataXFER_DB key is currently staged.
+  inline bool hasAMRDBItem(const std::string &keyName)
+  {
+    return getAMRDBItem(keyName) != 0 ;
+  }
+
+  /// Test whether a common AMR key is currently staged.
   inline bool hasAMRDBItem(AMRDBKey key)
   {
     return getAMRDBItem(key) != 0 ;
   }
 
+  /// Replace a raw DataXFER_DB entry. The old value is deleted first so callers
+  /// can safely restage the same key during repeated adaptation cycles.
+  inline void replaceAMRDBItem(const std::string &keyName,storeRepP item)
+  {
+    DataXFER_DB.deleteItem(keyName) ;
+    DataXFER_DB.insertItem(keyName,item) ;
+  }
+
+  /// Replace a common AMR DataXFER_DB entry.
   inline void replaceAMRDBItem(AMRDBKey key,storeRepP item)
   {
-    DataXFER_DB.deleteItem(amrDBKeyName(key)) ;
-    DataXFER_DB.insertItem(amrDBKeyName(key),item) ;
+    replaceAMRDBItem(amrDBKeyName(key),item) ;
   }
 
+  /// Delete a raw DataXFER_DB entry if present.
+  inline void deleteAMRDBItem(const std::string &keyName)
+  {
+    DataXFER_DB.deleteItem(keyName) ;
+  }
+
+  /// Delete a common AMR DataXFER_DB entry if present.
   inline void deleteAMRDBItem(AMRDBKey key)
   {
-    DataXFER_DB.deleteItem(amrDBKeyName(key)) ;
+    deleteAMRDBItem(amrDBKeyName(key)) ;
   }
 
+  /// Remove stale parent-child maps before a newly adapted mesh is staged.
   inline void clearAMRParentChildKeys()
   {
     deleteAMRDBItem(AMR_DB_C2P) ;
     deleteAMRDBItem(AMR_DB_C2P_GLOBAL) ;
   }
 
+  /// True when the generic tagging rules have staged nonzero refinement tags.
   inline bool hasAMRRefineTags()
   {
     return hasAMRDBItem(AMR_DB_REFINE_TAG) ;
   }
 
+  /// Convert adaptMode to the split-mode integer expected by onlineRefineMesh:
+  /// 2D -> 1, isotropic -> 2, and anisotropic/default -> 0.
   inline int amrSplitModeFromAdaptMode(const std::string &mode)
   {
     if(mode == "2D")
@@ -104,6 +145,8 @@ namespace Loci {
     return 0 ;
   }
 
+  /// Read AMR vars-file facts, update the low-level FVMAdapt globals, and
+  /// return the split-mode integer that the driver passes to onlineRefineMesh().
   inline int configureFVMAdaptGlobals(fact_db &facts)
   {
     int adaptMode = 0 ;
@@ -132,6 +175,7 @@ namespace Loci {
     return adaptMode ;
   }
 
+  /// Create one adaptSensor(NAME) boolean fact used by parametric sensor rules.
   inline void createAdaptSensorFact(fact_db &facts,const std::string &name)
   {
     const std::string switchVar =
@@ -143,6 +187,8 @@ namespace Loci {
     }
   }
 
+  /// Parse adaptSensor as a comma expression and expand it into
+  /// adaptSensor(NAME) facts. Applications call this after vars are loaded.
   inline void setupAdaptSensorFacts(fact_db &facts)
   {
     storeRepP asensor = facts.get_variable("adaptSensor") ;
@@ -176,6 +222,421 @@ namespace Loci {
       createAdaptSensorFact(facts,(*li)->name) ;
     }
   }
+
+  /// Redistribute a local cell store into the file-order distribution expected
+  /// by FVMAdapt's AMR interpolation support.
+  inline storeRepP redistributeAMRStoreToFileOrder(storeRepP rep,entitySet dom,
+                                                   fact_db::distribute_infoP dist)
+  {
+    Map l2f ;
+    getL2FMap(l2f,dom,dist) ;
+    std::vector<int> splits ;
+    FindSimpleDistribution(dom,l2f,splits,MPI_COMM_WORLD) ;
+    storeRepP vardist = 0 ;
+    redistributeStore(vardist,rep,dom,l2f,splits,MPI_COMM_WORLD) ;
+    return vardist ;
+  }
+
+  /// Base rule for staging a scalar cell field before in-memory AMR remapping.
+  /// Solvers instantiate this with their own field names and DB keys.
+  class AMRTransferScalar : public pointwise_rule {
+    std::string currentVarName,previousVarName,currentDBName,previousDBName ;
+    bool hasPrevious ;
+    const_store<real_t> currentVar ;
+    const_store<real_t> previousVar ;
+    param<bool> outputVar ;
+  public:
+    AMRTransferScalar(const std::string &currentVarName,
+                      const std::string &previousVarName,
+                      const std::string &currentDBName,
+                      const std::string &previousDBName,
+                      const std::string &constraintName,
+                      const std::string &conditionalName,
+                      const std::string &domainConstraintName,
+                      const std::string &outputName) :
+      currentVarName(currentVarName),previousVarName(previousVarName),
+      currentDBName(currentDBName),previousDBName(previousDBName),
+      hasPrevious(previousVarName != "" && previousDBName != "")
+    {
+      name_store(currentVarName,currentVar) ;
+      if(hasPrevious)
+        name_store(previousVarName,previousVar) ;
+      name_store(outputName,outputVar) ;
+      input(currentVarName) ;
+      if(hasPrevious)
+        input(previousVarName) ;
+      output(outputName) ;
+      conditional(conditionalName) ;
+      constraint(domainConstraintName) ;
+      if(constraintName != "")
+        constraint(constraintName) ;
+      disable_threading() ;
+    }
+
+    void compute(const sequence &seq) {
+      entitySet dom = entitySet(seq) ;
+      fact_db::distribute_infoP dist =
+        exec_current_fact_db->get_distribute_info() ;
+
+      store<real_t> currentSave ;
+      currentSave.allocate(dom) ;
+      for(sequence::const_iterator si=seq.begin();si!=seq.end();++si) {
+        Entity ii = *si ;
+        currentSave[ii] = currentVar[ii] ;
+      }
+      replaceAMRDBItem(currentDBName,
+                       redistributeAMRStoreToFileOrder(currentSave.Rep(),
+                                                       dom,dist)) ;
+
+      if(hasPrevious) {
+        store<real_t> previousSave ;
+        previousSave.allocate(dom) ;
+        for(sequence::const_iterator si=seq.begin();si!=seq.end();++si) {
+          Entity ii = *si ;
+          previousSave[ii] = previousVar[ii] ;
+        }
+        replaceAMRDBItem(previousDBName,
+                         redistributeAMRStoreToFileOrder(previousSave.Rep(),
+                                                         dom,dist)) ;
+      }
+    }
+  } ;
+
+  /// Base rule for staging a vector cell field before in-memory AMR remapping.
+  class AMRTransferVector : public pointwise_rule {
+    std::string currentVarName,previousVarName,currentDBName,previousDBName ;
+    bool hasPrevious ;
+    const_store<vector3d<real_t> > currentVar ;
+    const_store<vector3d<real_t> > previousVar ;
+    param<bool> outputVar ;
+  public:
+    AMRTransferVector(const std::string &currentVarName,
+                      const std::string &previousVarName,
+                      const std::string &currentDBName,
+                      const std::string &previousDBName,
+                      const std::string &constraintName,
+                      const std::string &conditionalName,
+                      const std::string &domainConstraintName,
+                      const std::string &outputName) :
+      currentVarName(currentVarName),previousVarName(previousVarName),
+      currentDBName(currentDBName),previousDBName(previousDBName),
+      hasPrevious(previousVarName != "" && previousDBName != "")
+    {
+      name_store(currentVarName,currentVar) ;
+      if(hasPrevious)
+        name_store(previousVarName,previousVar) ;
+      name_store(outputName,outputVar) ;
+      input(currentVarName) ;
+      if(hasPrevious)
+        input(previousVarName) ;
+      output(outputName) ;
+      conditional(conditionalName) ;
+      constraint(domainConstraintName) ;
+      if(constraintName != "")
+        constraint(constraintName) ;
+      disable_threading() ;
+    }
+
+    void compute(const sequence &seq) {
+      entitySet dom = entitySet(seq) ;
+      fact_db::distribute_infoP dist =
+        exec_current_fact_db->get_distribute_info() ;
+
+      store<vector3d<real_t> > currentSave ;
+      currentSave.allocate(dom) ;
+      for(sequence::const_iterator si=seq.begin();si!=seq.end();++si) {
+        Entity ii = *si ;
+        currentSave[ii] = currentVar[ii] ;
+      }
+      replaceAMRDBItem(currentDBName,
+                       redistributeAMRStoreToFileOrder(currentSave.Rep(),
+                                                       dom,dist)) ;
+
+      if(hasPrevious) {
+        store<vector3d<real_t> > previousSave ;
+        previousSave.allocate(dom) ;
+        for(sequence::const_iterator si=seq.begin();si!=seq.end();++si) {
+          Entity ii = *si ;
+          previousSave[ii] = previousVar[ii] ;
+        }
+        replaceAMRDBItem(previousDBName,
+                         redistributeAMRStoreToFileOrder(previousSave.Rep(),
+                                                         dom,dist)) ;
+      }
+    }
+  } ;
+
+  /// Base rule for staging a variable-length vector cell field before AMR
+  /// remapping. The child vector size is recovered from the staged parent data.
+  class AMRTransferStoreVec : public pointwise_rule {
+    std::string currentVarName,previousVarName,currentDBName,previousDBName ;
+    bool hasPrevious ;
+    const_storeVec<real_t> currentVar ;
+    const_storeVec<real_t> previousVar ;
+    param<bool> outputVar ;
+  public:
+    AMRTransferStoreVec(const std::string &currentVarName,
+                        const std::string &previousVarName,
+                        const std::string &currentDBName,
+                        const std::string &previousDBName,
+                        const std::string &constraintName,
+                        const std::string &conditionalName,
+                        const std::string &domainConstraintName,
+                        const std::string &outputName) :
+      currentVarName(currentVarName),previousVarName(previousVarName),
+      currentDBName(currentDBName),previousDBName(previousDBName),
+      hasPrevious(previousVarName != "" && previousDBName != "")
+    {
+      name_store(currentVarName,currentVar) ;
+      if(hasPrevious)
+        name_store(previousVarName,previousVar) ;
+      name_store(outputName,outputVar) ;
+      input(currentVarName) ;
+      if(hasPrevious)
+        input(previousVarName) ;
+      output(outputName) ;
+      conditional(conditionalName) ;
+      constraint(domainConstraintName) ;
+      if(constraintName != "")
+        constraint(constraintName) ;
+      disable_threading() ;
+    }
+
+    void compute(const sequence &seq) {
+      entitySet dom = entitySet(seq) ;
+      fact_db::distribute_infoP dist =
+        exec_current_fact_db->get_distribute_info() ;
+
+      storeVec<real_t> currentSave ;
+      currentSave.setVecSize(currentVar.vecSize()) ;
+      currentSave.allocate(dom) ;
+      for(sequence::const_iterator si=seq.begin();si!=seq.end();++si) {
+        Entity ii = *si ;
+        currentSave[ii] = currentVar[ii] ;
+      }
+      replaceAMRDBItem(currentDBName,
+                       redistributeAMRStoreToFileOrder(currentSave.Rep(),
+                                                       dom,dist)) ;
+
+      if(hasPrevious) {
+        storeVec<real_t> previousSave ;
+        previousSave.setVecSize(previousVar.vecSize()) ;
+        previousSave.allocate(dom) ;
+        for(sequence::const_iterator si=seq.begin();si!=seq.end();++si) {
+          Entity ii = *si ;
+          previousSave[ii] = previousVar[ii] ;
+        }
+        replaceAMRDBItem(previousDBName,
+                         redistributeAMRStoreToFileOrder(previousSave.Rep(),
+                                                         dom,dist)) ;
+      }
+    }
+  } ;
+
+  /// Base rule for interpolating a staged scalar parent field onto adapted cells.
+  class AMRRestartScalar : public pointwise_rule {
+    std::string outputVarName,keyName ;
+    const_param<int> restartFlag ;
+    const_blackbox<AMRinterpolation> mapping ;
+    store<real_t> childData ;
+  public:
+    AMRRestartScalar(const std::string &outputVarName,
+                     const std::string &keyName,
+                     const std::string &constraintName,
+                     const std::string &restartConstraintName,
+                     const std::string &domainConstraintName,
+                     const std::string &restartFlagName,
+                     const std::string &mappingName) :
+      outputVarName(outputVarName),keyName(keyName)
+    {
+      name_store(outputVarName,childData) ;
+      name_store(restartFlagName,restartFlag) ;
+      name_store(mappingName,mapping) ;
+      input(restartFlagName) ;
+      input(mappingName) ;
+      output(outputVarName) ;
+      constraint(restartConstraintName) ;
+      constraint(domainConstraintName) ;
+      if(constraintName != "")
+        constraint(constraintName) ;
+      disable_threading() ;
+    }
+
+    void compute(const sequence &) {
+      store<real_t> parent ;
+      storeRepP ptr = getAMRDBItem(keyName) ;
+      if(ptr == 0) {
+        std::cerr << "ERROR: " << keyName
+                  << " not found in DataXFER_DB." << std::endl ;
+        Abort() ;
+      }
+      parent = ptr ;
+      mapping->interpolateData(parent,childData) ;
+      parent.allocate(EMPTY) ;
+      deleteAMRDBItem(keyName) ;
+    }
+  } ;
+
+  /// Base rule for interpolating a staged vector parent field onto adapted cells.
+  class AMRRestartVector : public pointwise_rule {
+    std::string outputVarName,keyName ;
+    const_param<int> restartFlag ;
+    const_blackbox<AMRinterpolation> mapping ;
+    store<vector3d<real_t> > childData ;
+  public:
+    AMRRestartVector(const std::string &outputVarName,
+                     const std::string &keyName,
+                     const std::string &constraintName,
+                     const std::string &restartConstraintName,
+                     const std::string &domainConstraintName,
+                     const std::string &restartFlagName,
+                     const std::string &mappingName) :
+      outputVarName(outputVarName),keyName(keyName)
+    {
+      name_store(outputVarName,childData) ;
+      name_store(restartFlagName,restartFlag) ;
+      name_store(mappingName,mapping) ;
+      input(restartFlagName) ;
+      input(mappingName) ;
+      output(outputVarName) ;
+      constraint(restartConstraintName) ;
+      constraint(domainConstraintName) ;
+      if(constraintName != "")
+        constraint(constraintName) ;
+      disable_threading() ;
+    }
+
+    void compute(const sequence &) {
+      store<vector3d<real_t> > parent ;
+      storeRepP ptr = getAMRDBItem(keyName) ;
+      if(ptr == 0) {
+        std::cerr << "ERROR: " << keyName
+                  << " not found in DataXFER_DB." << std::endl ;
+        Abort() ;
+      }
+      parent = ptr ;
+      mapping->interpolateData(parent,childData) ;
+      parent.allocate(EMPTY) ;
+      deleteAMRDBItem(keyName) ;
+    }
+  } ;
+
+  /// Base rule for interpolating a staged storeVec parent field onto adapted cells.
+  class AMRRestartStoreVec : public pointwise_rule {
+    std::string outputVarName,keyName ;
+    const_param<int> restartFlag ;
+    const_blackbox<AMRinterpolation> mapping ;
+    storeVec<real_t> childData ;
+  public:
+    AMRRestartStoreVec(const std::string &outputVarName,
+                       const std::string &keyName,
+                       const std::string &constraintName,
+                       const std::string &restartConstraintName,
+                       const std::string &domainConstraintName,
+                       const std::string &restartFlagName,
+                       const std::string &mappingName) :
+      outputVarName(outputVarName),keyName(keyName)
+    {
+      name_store(outputVarName,childData) ;
+      name_store(restartFlagName,restartFlag) ;
+      name_store(mappingName,mapping) ;
+      input(restartFlagName) ;
+      input(mappingName) ;
+      output(outputVarName) ;
+      constraint(restartConstraintName) ;
+      constraint(domainConstraintName) ;
+      if(constraintName != "")
+        constraint(constraintName) ;
+      disable_threading() ;
+    }
+
+    void compute(const sequence &) {
+      storeVec<real_t> parent ;
+      storeRepP ptr = getAMRDBItem(keyName) ;
+      if(ptr == 0) {
+        std::cerr << "ERROR: " << keyName
+                  << " not found in DataXFER_DB." << std::endl ;
+        Abort() ;
+      }
+      parent = ptr ;
+      childData.setVecSize(parent.vecSize()) ;
+      mapping->interpolateData(parent,childData) ;
+      parent.allocate(EMPTY) ;
+      deleteAMRDBItem(keyName) ;
+    }
+  } ;
 }
+
+#define FVMAMR_TRANSFER_SCALAR_RULE(RULE_NAME,CURRENT_VAR,PREVIOUS_VAR, \
+                                    CURRENT_KEY,PREVIOUS_KEY, \
+                                    CONSTRAINT_NAME,CONDITIONAL_NAME, \
+                                    DOMAIN_CONSTRAINT,OUTPUT_NAME) \
+  class RULE_NAME : public Loci::AMRTransferScalar {\
+  public:\
+    RULE_NAME() : Loci::AMRTransferScalar(CURRENT_VAR,PREVIOUS_VAR, \
+      CURRENT_KEY,PREVIOUS_KEY,CONSTRAINT_NAME,CONDITIONAL_NAME, \
+      DOMAIN_CONSTRAINT,OUTPUT_NAME) {}\
+  } ;\
+  register_rule<RULE_NAME> register_##RULE_NAME ;
+
+#define FVMAMR_TRANSFER_VECTOR_RULE(RULE_NAME,CURRENT_VAR,PREVIOUS_VAR, \
+                                    CURRENT_KEY,PREVIOUS_KEY, \
+                                    CONSTRAINT_NAME,CONDITIONAL_NAME, \
+                                    DOMAIN_CONSTRAINT,OUTPUT_NAME) \
+  class RULE_NAME : public Loci::AMRTransferVector {\
+  public:\
+    RULE_NAME() : Loci::AMRTransferVector(CURRENT_VAR,PREVIOUS_VAR, \
+      CURRENT_KEY,PREVIOUS_KEY,CONSTRAINT_NAME,CONDITIONAL_NAME, \
+      DOMAIN_CONSTRAINT,OUTPUT_NAME) {}\
+  } ;\
+  register_rule<RULE_NAME> register_##RULE_NAME ;
+
+#define FVMAMR_TRANSFER_STOREVEC_RULE(RULE_NAME,CURRENT_VAR,PREVIOUS_VAR, \
+                                      CURRENT_KEY,PREVIOUS_KEY, \
+                                      CONSTRAINT_NAME,CONDITIONAL_NAME, \
+                                      DOMAIN_CONSTRAINT,OUTPUT_NAME) \
+  class RULE_NAME : public Loci::AMRTransferStoreVec {\
+  public:\
+    RULE_NAME() : Loci::AMRTransferStoreVec(CURRENT_VAR,PREVIOUS_VAR, \
+      CURRENT_KEY,PREVIOUS_KEY,CONSTRAINT_NAME,CONDITIONAL_NAME, \
+      DOMAIN_CONSTRAINT,OUTPUT_NAME) {}\
+  } ;\
+  register_rule<RULE_NAME> register_##RULE_NAME ;
+
+#define FVMAMR_RESTART_SCALAR_RULE(RULE_NAME,OUTPUT_VAR,DB_KEY, \
+                                   CONSTRAINT_NAME,RESTART_CONSTRAINT, \
+                                   DOMAIN_CONSTRAINT,RESTART_FLAG, \
+                                   MAPPING_NAME) \
+  class RULE_NAME : public Loci::AMRRestartScalar {\
+  public:\
+    RULE_NAME() : Loci::AMRRestartScalar(OUTPUT_VAR,DB_KEY, \
+      CONSTRAINT_NAME,RESTART_CONSTRAINT,DOMAIN_CONSTRAINT,RESTART_FLAG, \
+      MAPPING_NAME) {}\
+  } ;\
+  register_rule<RULE_NAME> register_##RULE_NAME ;
+
+#define FVMAMR_RESTART_VECTOR_RULE(RULE_NAME,OUTPUT_VAR,DB_KEY, \
+                                   CONSTRAINT_NAME,RESTART_CONSTRAINT, \
+                                   DOMAIN_CONSTRAINT,RESTART_FLAG, \
+                                   MAPPING_NAME) \
+  class RULE_NAME : public Loci::AMRRestartVector {\
+  public:\
+    RULE_NAME() : Loci::AMRRestartVector(OUTPUT_VAR,DB_KEY, \
+      CONSTRAINT_NAME,RESTART_CONSTRAINT,DOMAIN_CONSTRAINT,RESTART_FLAG, \
+      MAPPING_NAME) {}\
+  } ;\
+  register_rule<RULE_NAME> register_##RULE_NAME ;
+
+#define FVMAMR_RESTART_STOREVEC_RULE(RULE_NAME,OUTPUT_VAR,DB_KEY, \
+                                     CONSTRAINT_NAME,RESTART_CONSTRAINT, \
+                                     DOMAIN_CONSTRAINT,RESTART_FLAG, \
+                                     MAPPING_NAME) \
+  class RULE_NAME : public Loci::AMRRestartStoreVec {\
+  public:\
+    RULE_NAME() : Loci::AMRRestartStoreVec(OUTPUT_VAR,DB_KEY, \
+      CONSTRAINT_NAME,RESTART_CONSTRAINT,DOMAIN_CONSTRAINT,RESTART_FLAG, \
+      MAPPING_NAME) {}\
+  } ;\
+  register_rule<RULE_NAME> register_##RULE_NAME ;
 
 #endif
