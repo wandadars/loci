@@ -31,17 +31,59 @@ namespace Loci {
   using std::cerr ;
   using std::endl ;
 
-  /// Activate parent-to-child interpolation only for adapted continuation. The
-  /// driver owns refineRestart and sets it after replacing the grid in memory.
-  $rule constraint(amr_restart<-refineRestart) {
+  /// Split ordinary marking queries from adapted-continuation queries. The
+  /// driver owns the legacy refineRestart continuation flag and sets it after
+  /// replacing the grid in memory.
+  $rule constraint(amr_restart,amr_not_restart<-refineRestart) {
     if($refineRestart > 0) {
       $amr_restart = ~EMPTY ;
+      $amr_not_restart = EMPTY ;
     } else {
       $amr_restart = EMPTY ;
+      $amr_not_restart = ~EMPTY ;
     }
   }
 
   $type AMRInterpolationMapping blackbox<Loci::AMRinterpolation> ;
+
+  /// Build the accepted lineage map from FVMAdapt's dynamic c2p relation and
+  /// the categorical parent facts staged before remeshing.
+  $rule blackbox(AMRLineageMap<-refineRestart),
+    constraint(amr_restart,geom_cells),prelude {
+    storeRepP ap = getAMRDBItem(AMR_DB_REQUESTED_ACTION) ;
+    storeRepP sp = getAMRDBItem(AMR_DB_REQUESTED_WINNING_SOURCE) ;
+    storeRepP tp = getAMRDBItem(AMR_DB_REQUESTED_ADAPT_STEP) ;
+    storeRepP lp = getAMRDBItem(AMR_DB_CELL_LEVEL) ;
+    if(ap == 0 || sp == 0 || tp == 0 || lp == 0) {
+      cerr << "ERROR: AMR accepted-history metadata not found in DataXFER_DB."
+           << endl ;
+      Abort() ;
+    }
+
+    store<pair<int,int> > c2pg ;
+    store<int> requestedAction ;
+    store<int> requestedSource ;
+    store<int> requestedStep ;
+    store<int> cellLevel ;
+    c2pg = getC2PGlobal(*exec_current_fact_db) ;
+    requestedAction = ap ;
+    requestedSource = sp ;
+    requestedStep = tp ;
+    cellLevel = lp ;
+    $AMRLineageMap->setup(c2pg,requestedAction,requestedSource,
+                          requestedStep,cellLevel) ;
+    requestedAction.allocate(EMPTY) ;
+    requestedSource.allocate(EMPTY) ;
+    requestedStep.allocate(EMPTY) ;
+    cellLevel.allocate(EMPTY) ;
+    deleteAMRDBItem(AMR_DB_REQUESTED_ACTION) ;
+    deleteAMRDBItem(AMR_DB_REQUESTED_WINNING_SOURCE) ;
+    deleteAMRDBItem(AMR_DB_REQUESTED_ADAPT_STEP) ;
+    deleteAMRDBItem(AMR_DB_CELL_LEVEL) ;
+  } ;
+
+  register_rule<AMRLineageClassification>
+    register_AMRLineageClassification ;
 
   /// Build the interpolation map from the geometric stencil staged before
   /// remeshing and the parent-child map created by FVMAdapt.

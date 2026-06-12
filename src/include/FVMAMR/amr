@@ -26,15 +26,365 @@
 #include <FVMAdapt/globals.h>
 #include <FVMAdapt/gridInterface.h>
 #include <Tools/expr.h>
+#include <distribute_io.h>
+#include <pnn.h>
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <iostream>
+#include <limits>
+#include <map>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Loci {
 
-  /// Typed names for the legacy FVMAdapt DataXFER_DB entries used during
-  /// in-memory adaptation. These wrappers document the string contract without
-  /// moving ownership of remeshing data out of FVMAdapt.
+  /// Signed commands used by solver-neutral AMR request composition.
+  enum AMRRequestCommand {
+    AMR_REQUEST_COARSEN = -1,
+    AMR_REQUEST_NONE    = 0,
+    AMR_REQUEST_REFINE  = 1
+  } ;
+
+  /// Topology changes observed from FVMAdapt's dynamic parent-child map.
+  enum AMRTopologyAction {
+    AMR_TOPOLOGY_COARSENED = -1,
+    AMR_TOPOLOGY_DIRECT    = 0,
+    AMR_TOPOLOGY_REFINED   = 1
+  } ;
+
+  /// C++ policy vocabulary used to choose one command when AMR request sources
+  /// disagree. The current scheduler-visible `.loci` rules implement the
+  /// priority/source-id subset of this vocabulary.
+  enum AMRFusionPolicy {
+    /// Highest source priority wins; request strength breaks priority ties.
+    AMR_FUSION_PRIORITY = 0,
+    /// Highest request strength wins; source priority breaks strength ties.
+    AMR_FUSION_STRENGTH = 1,
+    /// Each active source gets one vote for refine or coarsen.
+    AMR_FUSION_EQUAL_VOTE = 2,
+    /// Source order wins. Changing firstSource between cycles gives a simple
+    /// round-robin policy without adding hidden mutable state to the arbiter.
+    AMR_FUSION_SOURCE_ORDER = 3
+  } ;
+
+  /// Normalize arbitrary signed integers to the AMR request command set.
+  inline int amrNormalizeRequestCommand(int command)
+  {
+    if(command > 0)
+      return AMR_REQUEST_REFINE ;
+    if(command < 0)
+      return AMR_REQUEST_COARSEN ;
+    return AMR_REQUEST_NONE ;
+  }
+
+  /// Metadata for one source that may request refinement or coarsening.
+  struct AMRRequestSource {
+    std::string name ;
+    std::string kind ;
+    int priority ;
+    bool hardConstraint ;
+
+    AMRRequestSource() : name(""),kind(""),priority(0),
+      hardConstraint(false) {}
+
+    AMRRequestSource(const std::string &sourceName,
+                     const std::string &sourceKind,
+                     int sourcePriority,
+                     bool hard) :
+      name(sourceName),kind(sourceKind),priority(sourcePriority),
+      hardConstraint(hard) {}
+  } ;
+
+  /// One source's request for one cell.
+  struct AMRCellRequest {
+    int source ;
+    int command ;
+    double strength ;
+    int targetLevel ;
+    double targetSize ;
+
+    AMRCellRequest() : source(-1),command(AMR_REQUEST_NONE),
+      strength(0.0),targetLevel(-1),targetSize(-1.0) {}
+
+    AMRCellRequest(int sourceID,int requestCommand,double requestStrength) :
+      source(sourceID),command(amrNormalizeRequestCommand(requestCommand)),
+      strength(requestStrength),targetLevel(-1),targetSize(-1.0) {}
+
+    AMRCellRequest(int sourceID,int requestCommand,double requestStrength,
+                   int desiredLevel,double desiredSize) :
+      source(sourceID),command(amrNormalizeRequestCommand(requestCommand)),
+      strength(requestStrength),targetLevel(desiredLevel),
+      targetSize(desiredSize) {}
+
+    bool active() const { return source >= 0 && command != AMR_REQUEST_NONE ; }
+  } ;
+
+  /// Rules used by AMRRequestArbiter when fusing requests.
+  struct AMRFusionRules {
+    AMRFusionPolicy policy ;
+    bool hardConstraintsFirst ;
+    bool preferRefineOnTie ;
+    bool keepOnEqualVoteTie ;
+    int firstSource ;
+
+    AMRFusionRules() : policy(AMR_FUSION_PRIORITY),
+      hardConstraintsFirst(true),preferRefineOnTie(true),
+      keepOnEqualVoteTie(true),firstSource(0) {}
+  } ;
+
+  /// Result of fusing all active requests for one cell.
+  struct AMRFusionResult {
+    int command ;
+    int winningSource ;
+    double winningStrength ;
+    int refineRequestCount ;
+    int coarsenRequestCount ;
+    int conflictCount ;
+
+    AMRFusionResult() : command(AMR_REQUEST_NONE),winningSource(-1),
+      winningStrength(0.0),refineRequestCount(0),coarsenRequestCount(0),
+      conflictCount(0) {}
+  } ;
+
+  /// Source registry and deterministic request-fusion helper for custom C++
+  /// policies.
+  ///
+  /// The stock .loci schedule does not consult this object; it uses
+  /// amrSourcePriority(SRC), then the lowest amrSourceID(SRC), then the selected
+  /// source's command. Custom C++ rules can assemble AMRCellRequest values and
+  /// call fuse() directly when a richer policy is needed.
+  class AMRRequestArbiter {
+    std::vector<AMRRequestSource> sources ;
+    AMRFusionRules rules ;
+
+    bool validSource(int source) const
+    {
+      return source >= 0 && source < int(sources.size()) ;
+    }
+
+    bool sourceIsHard(int source) const
+    {
+      return validSource(source) && sources[source].hardConstraint ;
+    }
+
+    int sourcePriority(int source) const
+    {
+      if(validSource(source))
+        return sources[source].priority ;
+      return 0 ;
+    }
+
+    int sourceOrderRank(int source) const
+    {
+      const int nsrc = int(sources.size()) ;
+      if(nsrc <= 0)
+        return source ;
+
+      int first = rules.firstSource%nsrc ;
+      if(first < 0)
+        first += nsrc ;
+
+      int rank = source-first ;
+      if(rank < 0)
+        rank += nsrc ;
+      return rank ;
+    }
+
+    bool winsByPriority(const AMRCellRequest &a,
+                        const AMRCellRequest &b) const
+    {
+      const int ap = sourcePriority(a.source) ;
+      const int bp = sourcePriority(b.source) ;
+      if(ap != bp)
+        return ap > bp ;
+      if(a.strength != b.strength)
+        return a.strength > b.strength ;
+      if(a.command != b.command && rules.preferRefineOnTie)
+        return a.command > b.command ;
+      return a.source < b.source ;
+    }
+
+    bool winsByStrength(const AMRCellRequest &a,
+                        const AMRCellRequest &b) const
+    {
+      if(a.strength != b.strength)
+        return a.strength > b.strength ;
+      const int ap = sourcePriority(a.source) ;
+      const int bp = sourcePriority(b.source) ;
+      if(ap != bp)
+        return ap > bp ;
+      if(a.command != b.command && rules.preferRefineOnTie)
+        return a.command > b.command ;
+      return a.source < b.source ;
+    }
+
+    bool winsBySourceOrder(const AMRCellRequest &a,
+                           const AMRCellRequest &b) const
+    {
+      const int ar = sourceOrderRank(a.source) ;
+      const int br = sourceOrderRank(b.source) ;
+      if(ar != br)
+        return ar < br ;
+      if(a.strength != b.strength)
+        return a.strength > b.strength ;
+      return winsByPriority(a,b) ;
+    }
+
+    bool requestWins(const AMRCellRequest &a,
+                     const AMRCellRequest &b) const
+    {
+      if(rules.hardConstraintsFirst) {
+        const bool ah = sourceIsHard(a.source) ;
+        const bool bh = sourceIsHard(b.source) ;
+        if(ah != bh)
+          return ah ;
+      }
+
+      if(rules.policy == AMR_FUSION_STRENGTH)
+        return winsByStrength(a,b) ;
+      if(rules.policy == AMR_FUSION_SOURCE_ORDER)
+        return winsBySourceOrder(a,b) ;
+      return winsByPriority(a,b) ;
+    }
+
+  public:
+    AMRRequestArbiter() {}
+
+    explicit AMRRequestArbiter(const AMRFusionRules &fusionRules) :
+      rules(fusionRules) {}
+
+    void clearSources() { sources.clear() ; }
+
+    int addSource(const std::string &name,const std::string &kind,
+                  int priority,bool hardConstraint)
+    {
+      const int existing = sourceIndex(name) ;
+      if(existing >= 0)
+        return existing ;
+      sources.push_back(AMRRequestSource(name,kind,priority,hardConstraint)) ;
+      return int(sources.size())-1 ;
+    }
+
+    int sourceIndex(const std::string &name) const
+    {
+      for(size_t i=0;i<sources.size();++i)
+        if(sources[i].name == name)
+          return int(i) ;
+      return -1 ;
+    }
+
+    const AMRRequestSource &source(int sourceID) const
+    {
+      return sources[sourceID] ;
+    }
+
+    const std::vector<AMRRequestSource> &requestSources() const
+    {
+      return sources ;
+    }
+
+    size_t numSources() const { return sources.size() ; }
+
+    void setRules(const AMRFusionRules &fusionRules)
+    {
+      rules = fusionRules ;
+    }
+
+    const AMRFusionRules &fusionRules() const { return rules ; }
+
+    AMRFusionResult fuse(const std::vector<AMRCellRequest> &requests) const
+    {
+      AMRFusionResult result ;
+      bool hardOnly = false ;
+      if(rules.hardConstraintsFirst) {
+        for(size_t i=0;i<requests.size();++i) {
+          if(requests[i].active() && sourceIsHard(requests[i].source)) {
+            hardOnly = true ;
+            break ;
+          }
+        }
+      }
+
+      int activeCount = 0 ;
+      for(size_t i=0;i<requests.size();++i) {
+        const AMRCellRequest &req = requests[i] ;
+        if(!req.active())
+          continue ;
+        if(hardOnly && !sourceIsHard(req.source))
+          continue ;
+
+        activeCount++ ;
+        if(req.command == AMR_REQUEST_REFINE)
+          result.refineRequestCount++ ;
+        else if(req.command == AMR_REQUEST_COARSEN)
+          result.coarsenRequestCount++ ;
+      }
+
+      if(activeCount == 0)
+        return result ;
+
+      int voteCommand = AMR_REQUEST_NONE ;
+      if(rules.policy == AMR_FUSION_EQUAL_VOTE) {
+        if(result.refineRequestCount > result.coarsenRequestCount) {
+          voteCommand = AMR_REQUEST_REFINE ;
+        } else if(result.coarsenRequestCount > result.refineRequestCount) {
+          voteCommand = AMR_REQUEST_COARSEN ;
+        } else if(!rules.keepOnEqualVoteTie) {
+          voteCommand = rules.preferRefineOnTie ?
+            AMR_REQUEST_REFINE : AMR_REQUEST_COARSEN ;
+        }
+
+        if(voteCommand == AMR_REQUEST_NONE) {
+          result.conflictCount = activeCount ;
+          return result ;
+        }
+      }
+
+      bool haveWinner = false ;
+      AMRCellRequest winner ;
+      for(size_t i=0;i<requests.size();++i) {
+        const AMRCellRequest &req = requests[i] ;
+        if(!req.active())
+          continue ;
+        if(hardOnly && !sourceIsHard(req.source))
+          continue ;
+        if(voteCommand != AMR_REQUEST_NONE && req.command != voteCommand)
+          continue ;
+
+        if(!haveWinner || requestWins(req,winner)) {
+          winner = req ;
+          haveWinner = true ;
+        }
+      }
+
+      if(!haveWinner)
+        return result ;
+
+      result.command = winner.command ;
+      result.winningSource = winner.source ;
+      result.winningStrength = winner.strength ;
+
+      for(size_t i=0;i<requests.size();++i) {
+        const AMRCellRequest &req = requests[i] ;
+        if(!req.active())
+          continue ;
+        if(hardOnly && !sourceIsHard(req.source))
+          continue ;
+        if(req.command != result.command)
+          result.conflictCount++ ;
+      }
+
+      return result ;
+    }
+  } ;
+
+  /// Typed names for FVMAdapt DataXFER_DB entries used by the online in-memory
+  /// adaptation path. These enum keys reserve the common FVMAMR/FVMAdapt string
+  /// names; solver field keys should use solver-specific names to avoid
+  /// collisions in the shared DataXFER_DB staging area.
   enum AMRDBKey {
     AMR_DB_ADAPT_CYCLE,
     AMR_DB_REFINE_TAG,
@@ -43,6 +393,10 @@ namespace Loci {
     AMR_DB_NEXT_PLAN,
     AMR_DB_C2P,
     AMR_DB_C2P_GLOBAL,
+    AMR_DB_REQUESTED_ACTION,
+    AMR_DB_REQUESTED_WINNING_SOURCE,
+    AMR_DB_REQUESTED_ADAPT_STEP,
+    AMR_DB_CELL_LEVEL,
     AMR_DB_CELL_PARTITION_WEIGHTS,
     AMR_DB_GRAD_CELLS,
     AMR_DB_DELTAS,
@@ -61,6 +415,11 @@ namespace Loci {
     case AMR_DB_NEXT_PLAN:              return "nextPlan" ;
     case AMR_DB_C2P:                    return "c2p" ;
     case AMR_DB_C2P_GLOBAL:             return "c2pglobal" ;
+    case AMR_DB_REQUESTED_ACTION:       return "amrRequestedAction" ;
+    case AMR_DB_REQUESTED_WINNING_SOURCE:
+      return "amrRequestedWinningSource" ;
+    case AMR_DB_REQUESTED_ADAPT_STEP:   return "amrRequestedAdaptStep" ;
+    case AMR_DB_CELL_LEVEL:             return "amrCellLevel" ;
     case AMR_DB_CELL_PARTITION_WEIGHTS: return "cellPartitionWeights" ;
     case AMR_DB_GRAD_CELLS:             return "gradCells" ;
     case AMR_DB_DELTAS:                 return "deltas" ;
@@ -70,8 +429,9 @@ namespace Loci {
     return "" ;
   }
 
-  /// Fetch a DataXFER_DB item by raw key name. Prefer the enum overload when
-  /// the key is part of the common FVMAMR/FVMAdapt contract.
+  /// Fetch a DataXFER_DB item by raw key name. This returns the staged object,
+  /// not a copy. Prefer the enum overload when the key is part of the common
+  /// FVMAMR/FVMAdapt contract.
   inline storeRepP getAMRDBItem(const std::string &keyName)
   {
     return DataXFER_DB.getItem(keyName) ;
@@ -95,8 +455,8 @@ namespace Loci {
     return getAMRDBItem(key) != 0 ;
   }
 
-  /// Replace a raw DataXFER_DB entry. The old value is deleted first so callers
-  /// can safely restage the same key during repeated adaptation cycles.
+  /// Replace a raw DataXFER_DB entry. The old value is deleted first, so this is
+  /// destructive for any previous owner of the same key.
   inline void replaceAMRDBItem(const std::string &keyName,storeRepP item)
   {
     DataXFER_DB.deleteItem(keyName) ;
@@ -128,14 +488,407 @@ namespace Loci {
     deleteAMRDBItem(AMR_DB_C2P_GLOBAL) ;
   }
 
-  /// True when the generic tagging rules have staged nonzero refinement tags.
+  /// One parent contribution to a current cell's accepted AMR history.
+  struct AMRParentHistory {
+    int parent ;
+    int requestedAction ;
+    int requestedSource ;
+    int requestedStep ;
+    int cellLevel ;
+    int childCount ;
+
+    AMRParentHistory() : parent(-1),requestedAction(AMR_REQUEST_NONE),
+      requestedSource(-1),requestedStep(-1),cellLevel(0),childCount(0) {}
+
+    AMRParentHistory(int parentID,int action,int source,int step,int level,
+                     int parentChildCount) :
+      parent(parentID),requestedAction(amrNormalizeRequestCommand(action)),
+      requestedSource(source),requestedStep(step),
+      cellLevel(std::max(0,level)),childCount(parentChildCount)
+    {}
+  } ;
+
+  /// One current-cell view of the dynamic parent-child relation emitted by
+  /// FVMAdapt. Child ids are current global cell numbers; parent ids are the
+  /// normalized file-order keys used by the staged parent stores.
+  struct AMRLineageInfo {
+    int mapped ;
+    int topologyAction ;
+    int parentCount ;
+    int childCount ;
+    int acceptedAction ;
+    int acceptedWinningSource ;
+    int acceptedAdaptStep ;
+    int cellLevel ;
+    std::vector<AMRParentHistory> parents ;
+
+    AMRLineageInfo() : mapped(0),topologyAction(AMR_TOPOLOGY_DIRECT),
+      parentCount(0),childCount(0),acceptedAction(AMR_REQUEST_NONE),
+      acceptedWinningSource(-1),acceptedAdaptStep(-1),cellLevel(0) {}
+  } ;
+
+  /// Solver-neutral classifier for the dynamic FVMAdapt c2p/c2pglobal map and
+  /// the categorical parent history staged before remeshing.
+  ///
+  /// The class intentionally does not interpret currentPlan or nextPlan. It
+  /// projects the accepted remesh relation into small per-cell facts.
+  class AMRLineageMap {
+    std::map<int,AMRLineageInfo> childInfo ;
+
+    static int localMinOrMax(entitySet dom)
+    {
+      if(dom == EMPTY)
+        return std::numeric_limits<int>::max() ;
+      return dom.Min() ;
+    }
+
+    static int globalMin(int localValue)
+    {
+      int value = localValue ;
+      MPI_Allreduce(&localValue,&value,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD) ;
+      return value ;
+    }
+
+    static int ownerForEntity(const std::vector<entitySet> &ptn,int entity)
+    {
+      for(size_t i=0;i<ptn.size();++i)
+        if(ptn[i].inSet(entity))
+          return int(i) ;
+      return -1 ;
+    }
+
+    static void fillParentChildCounts(const std::map<int,int> &localCounts,
+                                      const std::vector<entitySet> &parentPtn,
+                                      store<int> &parentChildCounts)
+    {
+      entitySet parentDomain = parentChildCounts.domain() ;
+      FORALL(parentDomain,ii) {
+        parentChildCounts[ii] = 0 ;
+      } ENDFORALL ;
+
+      int p = 1 ;
+      int r = 0 ;
+      MPI_Comm_size(MPI_COMM_WORLD,&p) ;
+      MPI_Comm_rank(MPI_COMM_WORLD,&r) ;
+
+      std::vector<std::vector<std::pair<int,int> > > sendByRank(p) ;
+      for(std::map<int,int>::const_iterator ci=localCounts.begin();
+          ci!=localCounts.end();++ci) {
+        const int owner = ownerForEntity(parentPtn,ci->first) ;
+        if(owner < 0) {
+          std::cerr << "ERROR: AMR parent " << ci->first
+                    << " is not owned by the staged parent history."
+                    << std::endl ;
+          Abort() ;
+        }
+        sendByRank[owner].push_back(*ci) ;
+      }
+
+      std::vector<int> sendCounts(p,0),recvCounts(p,0) ;
+      for(int i=0;i<p;++i)
+        sendCounts[i] = int(sendByRank[i].size()) ;
+      MPI_Alltoall(&sendCounts[0],1,MPI_INT,
+                   &recvCounts[0],1,MPI_INT,MPI_COMM_WORLD) ;
+
+      std::vector<int> sendOffsets(p,0),recvOffsets(p,0) ;
+      for(int i=1;i<p;++i) {
+        sendOffsets[i] = sendOffsets[i-1]+sendCounts[i-1] ;
+        recvOffsets[i] = recvOffsets[i-1]+recvCounts[i-1] ;
+      }
+
+      const int sendSize = sendOffsets[p-1]+sendCounts[p-1] ;
+      const int recvSize = recvOffsets[p-1]+recvCounts[p-1] ;
+      std::vector<std::pair<int,int> > sendBuffer(sendSize) ;
+      std::vector<std::pair<int,int> > recvBuffer(recvSize) ;
+      for(int i=0;i<p;++i)
+        std::copy(sendByRank[i].begin(),sendByRank[i].end(),
+                  sendBuffer.begin()+sendOffsets[i]) ;
+
+      MPI_Datatype bytearray ;
+      MPI_Type_vector(sizeof(std::pair<int,int>),1,1,MPI_BYTE,&bytearray) ;
+      MPI_Type_commit(&bytearray) ;
+      MPI_Alltoallv(sendBuffer.empty()?0:&sendBuffer[0],
+                    &sendCounts[0],&sendOffsets[0],bytearray,
+                    recvBuffer.empty()?0:&recvBuffer[0],
+                    &recvCounts[0],&recvOffsets[0],bytearray,
+                    MPI_COMM_WORLD) ;
+      MPI_Type_free(&bytearray) ;
+
+      for(size_t i=0;i<recvBuffer.size();++i) {
+        const int parent = recvBuffer[i].first ;
+        if(!parentDomain.inSet(parent)) {
+          std::cerr << "ERROR: AMR parent " << parent
+                    << " was delivered to rank " << r
+                    << " but is not locally staged." << std::endl ;
+          Abort() ;
+        }
+        parentChildCounts[parent] += recvBuffer[i].second ;
+      }
+    }
+
+    static int parentLevelForAction(const AMRLineageInfo &info)
+    {
+      if(info.parents.empty())
+        return 0 ;
+
+      if(info.topologyAction == AMR_TOPOLOGY_COARSENED) {
+        int level = std::numeric_limits<int>::max() ;
+        for(size_t i=0;i<info.parents.size();++i)
+          level = std::min(level,info.parents[i].cellLevel) ;
+        if(level == std::numeric_limits<int>::max())
+          level = 0 ;
+        return std::max(0,level-1) ;
+      }
+
+      int level = info.parents[0].cellLevel ;
+      if(info.topologyAction == AMR_TOPOLOGY_REFINED)
+        level++ ;
+      return std::max(0,level) ;
+    }
+
+    static void chooseAcceptedSource(AMRLineageInfo &info)
+    {
+      const int action = info.topologyAction ;
+      info.acceptedAction = action ;
+      info.acceptedWinningSource = -1 ;
+      info.acceptedAdaptStep = -1 ;
+
+      if(action == AMR_TOPOLOGY_DIRECT)
+        return ;
+
+      int matchedStep = -1 ;
+      for(size_t i=0;i<info.parents.size();++i) {
+        const AMRParentHistory &parent = info.parents[i] ;
+        if(parent.requestedAction != action)
+          continue ;
+
+        matchedStep = std::max(matchedStep,parent.requestedStep) ;
+        if(parent.requestedSource < 0)
+          continue ;
+
+        if(info.acceptedWinningSource < 0 ||
+           parent.requestedSource < info.acceptedWinningSource ||
+           (parent.requestedSource == info.acceptedWinningSource &&
+            parent.requestedStep > info.acceptedAdaptStep)) {
+          info.acceptedWinningSource = parent.requestedSource ;
+          info.acceptedAdaptStep = parent.requestedStep ;
+        }
+      }
+
+      if(info.acceptedWinningSource < 0)
+        info.acceptedAdaptStep = matchedStep ;
+    }
+
+  public:
+    void clear() { childInfo.clear() ; }
+
+    void setup(const store<std::pair<int,int> > &c2pg,
+               const store<int> &parentRequestedAction,
+               const store<int> &parentRequestedSource,
+               const store<int> &parentRequestedStep,
+               const store<int> &parentCellLevel)
+    {
+      clear() ;
+
+      entitySet dom = c2pg.domain() ;
+      const int parentMinLocal = localMinOrMax(parentRequestedAction.domain()) ;
+      const int parentMin = globalMin(parentMinLocal) ;
+      if(parentMin == std::numeric_limits<int>::max()) {
+        std::cerr << "ERROR: staged AMR parent history is empty." << std::endl ;
+        Abort() ;
+      }
+
+      int c2pParentMinLocal = std::numeric_limits<int>::max() ;
+      FORALL(dom,ii) {
+        c2pParentMinLocal = std::min(c2pParentMinLocal,c2pg[ii].second) ;
+      } ENDFORALL ;
+      const int c2pParentMin = globalMin(c2pParentMinLocal) ;
+      if(c2pParentMin == std::numeric_limits<int>::max())
+        return ;
+
+      entitySet requestSet ;
+      std::map<int,int> localParentChildCount ;
+      FORALL(dom,ii) {
+        const int parent = c2pg[ii].second-c2pParentMin+parentMin ;
+        requestSet += parent ;
+        localParentChildCount[parent]++ ;
+      } ENDFORALL ;
+
+      entitySet parentDomain = parentRequestedAction.domain() ;
+      std::vector<entitySet> parentPtn =
+        all_collect_vectors(parentDomain,MPI_COMM_WORLD) ;
+      store<int> parentChildCounts ;
+      parentChildCounts.allocate(parentDomain) ;
+      fillParentChildCounts(localParentChildCount,parentPtn,
+                            parentChildCounts) ;
+
+      dataPartitionP parentPartition =
+        createPartition(parentPtn,MPI_COMM_WORLD) ;
+      gatherCommSchedule parentComm ;
+      parentComm.generateSchedule(requestSet,parentPartition) ;
+
+      store<int> requestedActionData ;
+      store<int> requestedSourceData ;
+      store<int> requestedStepData ;
+      store<int> cellLevelData ;
+      store<int> parentChildCountData ;
+      parentComm.gatherData(requestedActionData,parentRequestedAction) ;
+      parentComm.gatherData(requestedSourceData,parentRequestedSource) ;
+      parentComm.gatherData(requestedStepData,parentRequestedStep) ;
+      parentComm.gatherData(cellLevelData,parentCellLevel) ;
+      parentComm.gatherData(parentChildCountData,parentChildCounts) ;
+
+      std::map<int,int> parentToLocal ;
+      getLocalContextMap(parentToLocal,requestSet) ;
+
+      FORALL(dom,ii) {
+        const int child = c2pg[ii].first ;
+        const int parent = c2pg[ii].second-c2pParentMin+parentMin ;
+        std::map<int,int>::const_iterator pi = parentToLocal.find(parent) ;
+        if(pi == parentToLocal.end()) {
+          std::cerr << "ERROR: AMR parent " << parent
+                    << " was not gathered for accepted history." << std::endl ;
+          Abort() ;
+        }
+
+        const int loc = pi->second ;
+        AMRLineageInfo &info = childInfo[child] ;
+        info.mapped = 1 ;
+        info.parents.push_back(AMRParentHistory(parent,
+                                                requestedActionData[loc],
+                                                requestedSourceData[loc],
+                                                requestedStepData[loc],
+                                                cellLevelData[loc],
+                                                parentChildCountData[loc])) ;
+      } ENDFORALL ;
+
+      for(std::map<int,AMRLineageInfo>::iterator ci=childInfo.begin();
+          ci!=childInfo.end();++ci) {
+        AMRLineageInfo &info = ci->second ;
+        info.parentCount = int(info.parents.size()) ;
+        info.childCount = 0 ;
+        for(size_t i=0;i<info.parents.size();++i) {
+          info.childCount = std::max(info.childCount,
+                                     info.parents[i].childCount) ;
+        }
+
+        if(info.parentCount > 1) {
+          info.topologyAction = AMR_TOPOLOGY_COARSENED ;
+        } else if(info.childCount > 1) {
+          info.topologyAction = AMR_TOPOLOGY_REFINED ;
+        } else {
+          info.topologyAction = AMR_TOPOLOGY_DIRECT ;
+        }
+
+        info.cellLevel = parentLevelForAction(info) ;
+        chooseAcceptedSource(info) ;
+      }
+    }
+
+    AMRLineageInfo info(int child) const
+    {
+      std::map<int,AMRLineageInfo>::const_iterator ci =
+        childInfo.find(child) ;
+      if(ci == childInfo.end())
+        return AMRLineageInfo() ;
+      return ci->second ;
+    }
+
+  } ;
+
+  /// Project AMRLineageMap into scheduler-visible topology and accepted-action
+  /// facts on the adapted mesh.
+  class AMRLineageClassification : public pointwise_rule {
+    const_blackbox<AMRLineageMap> lineage ;
+    const_param<int> refineLevel ;
+    store<int> topologyAction ;
+    store<int> lineageMapped ;
+    store<int> lineageParentCount ;
+    store<int> lineageChildCount ;
+    store<int> acceptedAction ;
+    store<int> acceptedWinningSource ;
+    store<int> acceptedAdaptStep ;
+    store<int> cellLevel ;
+    store<int> lastAction ;
+    store<int> lastWinningSource ;
+    store<int> lastAdaptStep ;
+
+  public:
+    AMRLineageClassification()
+    {
+      name_store("AMRLineageMap",lineage) ;
+      name_store("refineLevel",refineLevel) ;
+      name_store("amrTopologyAction",topologyAction) ;
+      name_store("amrLineageMapped",lineageMapped) ;
+      name_store("amrLineageParentCount",lineageParentCount) ;
+      name_store("amrLineageChildCount",lineageChildCount) ;
+      name_store("amrAcceptedAction",acceptedAction) ;
+      name_store("amrAcceptedWinningSource",acceptedWinningSource) ;
+      name_store("amrAcceptedAdaptStep",acceptedAdaptStep) ;
+      name_store("amrCellLevel",cellLevel) ;
+      name_store("amrLastAction",lastAction) ;
+      name_store("amrLastWinningSource",lastWinningSource) ;
+      name_store("amrLastAdaptStep",lastAdaptStep) ;
+      input("AMRLineageMap") ;
+      input("refineLevel") ;
+      output("amrTopologyAction") ;
+      output("amrLineageMapped") ;
+      output("amrLineageParentCount") ;
+      output("amrLineageChildCount") ;
+      output("amrAcceptedAction") ;
+      output("amrAcceptedWinningSource") ;
+      output("amrAcceptedAdaptStep") ;
+      output("amrCellLevel") ;
+      output("amrLastAction") ;
+      output("amrLastWinningSource") ;
+      output("amrLastAdaptStep") ;
+      constraint("amr_restart") ;
+      constraint("geom_cells") ;
+      disable_threading() ;
+    }
+
+    void compute(const sequence &seq)
+    {
+      fact_db::distribute_infoP dist =
+        exec_current_fact_db->get_distribute_info() ;
+      for(sequence::const_iterator si=seq.begin();si!=seq.end();++si) {
+        Entity cell = *si ;
+        Entity lookup = cell ;
+        if(dist != 0)
+          lookup = dist->l2g[cell] ;
+        AMRLineageInfo info = lineage->info(lookup) ;
+        const int action = info.mapped ? info.topologyAction :
+          AMR_TOPOLOGY_DIRECT ;
+        int step = info.acceptedAdaptStep ;
+        if(action != AMR_TOPOLOGY_DIRECT && step < 0)
+          step = *refineLevel ;
+        const int source = info.acceptedWinningSource ;
+
+        topologyAction[cell] = action ;
+        lineageMapped[cell] = info.mapped ;
+        lineageParentCount[cell] = info.parentCount ;
+        lineageChildCount[cell] = info.childCount ;
+        acceptedAction[cell] = action ;
+        acceptedWinningSource[cell] = source ;
+        acceptedAdaptStep[cell] = step ;
+        cellLevel[cell] = info.cellLevel ;
+        lastAction[cell] = action ;
+        lastWinningSource[cell] = source ;
+        lastAdaptStep[cell] = step ;
+      }
+    }
+  } ;
+
+  /// True when the generic tagging rules have staged a refineTag DB entry.
+  /// FVMAMR deletes the entry for no-op marking passes, so key existence is the
+  /// current nonzero-tag guard.
   inline bool hasAMRRefineTags()
   {
     return hasAMRDBItem(AMR_DB_REFINE_TAG) ;
   }
 
   /// Convert adaptMode to the split-mode integer expected by onlineRefineMesh:
-  /// 2D -> 1, isotropic -> 2, and anisotropic/default -> 0.
+  /// 2D -> 1, isotropic -> 2, and anisotropic/default/unknown -> 0.
   inline int amrSplitModeFromAdaptMode(const std::string &mode)
   {
     if(mode == "2D")
@@ -175,52 +928,1185 @@ namespace Loci {
     return adaptMode ;
   }
 
-  /// Create one adaptSensor(NAME) boolean fact used by parametric sensor rules.
-  inline void createAdaptSensorFact(fact_db &facts,const std::string &name)
+  /// Return the Loci fact name for a one-argument parametric variable.
+  /// For example, amrParametricName("adaptSensor","Perror") returns
+  /// "adaptSensor(Perror)".
+  inline std::string amrParametricName(const std::string &base,
+                                       const std::string &param)
   {
-    const std::string switchVar =
-      std::string("adaptSensor(") + name + std::string(")") ;
-    if(facts.get_variable(switchVar) == 0) {
-      param<bool> adaptSwitch ;
-      *adaptSwitch = true ;
-      facts.create_fact(switchVar,adaptSwitch) ;
+    return base + std::string("(") + param + std::string(")") ;
+  }
+
+  /// Create a boolean fact if the fact database does not already define it.
+  /// Existing facts are left untouched so solver-provided facts keep ownership.
+  inline void createAMRBoolFact(fact_db &facts,const std::string &name,
+                                bool value = true)
+  {
+    if(facts.get_variable(name) == 0) {
+      param<bool> fact ;
+      *fact = value ;
+      facts.create_fact(name,fact) ;
     }
   }
 
-  /// Parse adaptSensor as a comma expression and expand it into
-  /// adaptSensor(NAME) facts. Applications call this after vars are loaded.
-  inline void setupAdaptSensorFacts(fact_db &facts)
+  inline void createAMRDoubleFact(fact_db &facts,const std::string &name,
+                                  double value)
   {
-    storeRepP asensor = facts.get_variable("adaptSensor") ;
-    if(asensor == 0)
-      return ;
-
-    param<std::string> adaptSensor ;
-    adaptSensor = asensor ;
-    const std::string sensorList = *adaptSensor ;
-    if(sensorList == "")
-      return ;
-
-    exprP ep = expression::create(sensorList) ;
-    if(ep == 0) {
-      if(MPI_rank == 0)
-        std::cerr << "ERROR: Unable to interpret expression in 'adaptSensor'"
-                  << std::endl ;
-      Abort() ;
-    }
-
-    exprList sensors = collect_associative_op(ep,OP_COMMA) ;
-    for(exprList::const_iterator li=sensors.begin();li!=sensors.end();++li) {
-      if((*li)->op != OP_NAME) {
+    storeRepP existingPtr = facts.get_variable(name) ;
+    if(existingPtr != 0) {
+      param<double> existing ;
+      existing = existingPtr ;
+      if(std::fabs(*existing-value) > 1.0e-14) {
         if(MPI_rank == 0) {
-          std::cerr << "ERROR: Unable to interpret expression in 'adaptSensor'"
-                    << std::endl ;
-          (*li)->Print(std::cerr) ;
+          std::cerr << "ERROR: Conflicting values for '" << name
+                    << "' in AMR sensor setup" << std::endl ;
         }
         Abort() ;
       }
-      createAdaptSensorFact(facts,(*li)->name) ;
+      return ;
     }
+
+    param<double> fact ;
+    *fact = value ;
+    facts.create_fact(name,fact) ;
+  }
+
+  inline void createAMRIntFact(fact_db &facts,const std::string &name,
+                               int value)
+  {
+    storeRepP existingPtr = facts.get_variable(name) ;
+    if(existingPtr != 0) {
+      param<int> existing ;
+      existing = existingPtr ;
+      if(*existing != value) {
+        if(MPI_rank == 0) {
+          std::cerr << "ERROR: Conflicting values for '" << name
+                    << "' in AMR request-source setup" << std::endl ;
+        }
+        Abort() ;
+      }
+      return ;
+    }
+
+    param<int> fact ;
+    *fact = value ;
+    facts.create_fact(name,fact) ;
+  }
+
+  inline void createAMRStringFact(fact_db &facts,const std::string &name,
+                                  const std::string &value)
+  {
+    storeRepP existingPtr = facts.get_variable(name) ;
+    if(existingPtr != 0) {
+      param<std::string> existing ;
+      existing = existingPtr ;
+      if(*existing != value) {
+        if(MPI_rank == 0) {
+          std::cerr << "ERROR: Conflicting values for '" << name
+                    << "' in AMR request-source setup" << std::endl ;
+        }
+        Abort() ;
+      }
+      return ;
+    }
+
+    param<std::string> fact ;
+    *fact = value ;
+    facts.create_fact(name,fact) ;
+  }
+
+  inline void createAMRConstraintFact(fact_db &facts,const std::string &name,
+                                      const entitySet &value,int keySpace)
+  {
+    if(facts.get_variable(name) != 0)
+      return ;
+
+    constraint fact ;
+    *fact = value ;
+    fact.Rep()->setDomainKeySpace(keySpace) ;
+    facts.create_fact(name,fact) ;
+  }
+
+  /// Enable one scalar metric for the built-in scaled-error source. The metric
+  /// may be a solver-owned store such as Perror, or a module-generated store
+  /// such as amrScalarFaceJump(p).
+  inline void createAdaptSensorFact(fact_db &facts,const std::string &name,
+                                    double weight = 1.0)
+  {
+    if(weight < 0.0) {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: Negative AMR sensor weight for '" << name
+                  << "'" << std::endl ;
+      }
+      Abort() ;
+    }
+
+    createAMRBoolFact(facts,amrParametricName("adaptSensor",name)) ;
+    createAMRDoubleFact(facts,amrParametricName("adaptSensorWeight",name),
+                        weight) ;
+  }
+
+  /// Read a named option from a nested AMR metric option list. Missing options
+  /// return the caller-provided default; present options must be names/strings.
+  inline std::string amrGetOptionName(const options_list &options,
+                                      const std::string &option,
+                                      const std::string &defaultValue,
+                                      const std::string &context)
+  {
+    if(!options.optionExists(option))
+      return defaultValue ;
+
+    option_value_type valueType = options.getOptionValueType(option) ;
+    if(valueType != NAME && valueType != STRING) {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: AMR option '" << option << "' for " << context
+                  << " must be a name" << std::endl ;
+      }
+      Abort() ;
+    }
+
+    std::string value ;
+    option_values optionValue = options.getOption(option) ;
+    optionValue.get_value(value) ;
+    return value ;
+  }
+
+  /// Read a real-valued option from a nested AMR metric option list. This is used
+  /// for metric weights, which are dimensionless scale factors.
+  inline double amrGetOptionDouble(const options_list &options,
+                                   const std::string &option,
+                                   double defaultValue,
+                                   const std::string &context)
+  {
+    if(!options.optionExists(option))
+      return defaultValue ;
+
+    if(options.getOptionValueType(option) != REAL) {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: AMR option '" << option << "' for " << context
+                  << " must be a real value" << std::endl ;
+      }
+      Abort() ;
+    }
+
+    double value = defaultValue ;
+    options.getOption(option,value) ;
+    return value ;
+  }
+
+  /// Read an integer option from a nested AMR option list. The vars parser
+  /// stores numeric values as reals, so reject non-integral values explicitly.
+  inline int amrGetOptionInt(const options_list &options,
+                             const std::string &option,
+                             int defaultValue,
+                             const std::string &context)
+  {
+    if(!options.optionExists(option))
+      return defaultValue ;
+
+    if(options.getOptionValueType(option) != REAL) {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: AMR option '" << option << "' for " << context
+                  << " must be an integer value" << std::endl ;
+      }
+      Abort() ;
+    }
+
+    double value = double(defaultValue) ;
+    options.getOption(option,value) ;
+    const int intValue = int(value) ;
+    if(std::fabs(value-double(intValue)) > 1.0e-12) {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: AMR option '" << option << "' for " << context
+                  << " must be an integer value" << std::endl ;
+      }
+      Abort() ;
+    }
+    return intValue ;
+  }
+
+  /// Read a boolean option from a nested AMR option list.
+  inline bool amrGetOptionBool(const options_list &options,
+                               const std::string &option,
+                               bool defaultValue,
+                               const std::string &context)
+  {
+    if(!options.optionExists(option))
+      return defaultValue ;
+
+    if(options.getOptionValueType(option) != BOOLEAN) {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: AMR option '" << option << "' for " << context
+                  << " must be true or false" << std::endl ;
+      }
+      Abort() ;
+    }
+
+    bool value = defaultValue ;
+    options.getOption(option,value) ;
+    return value ;
+  }
+
+  /// Convert the bracketed option-list syntax used by adaptSensorMetrics into an
+  /// options_list object. For example, [type=scalar,weight=0.5] becomes an
+  /// options list with entries named type and weight.
+  inline options_list amrOptionsFromList(const options_list::arg_list &args,
+                                         const std::string &context)
+  {
+    options_list options ;
+    try {
+      options.Input(args) ;
+    } catch(const BasicException &err) {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: Unable to parse AMR metric options for "
+                  << context << std::endl ;
+        err.Print(std::cerr) ;
+      }
+      Abort() ;
+    }
+    return options ;
+  }
+
+  inline std::string amrLowerString(const std::string &input)
+  {
+    std::string value = input ;
+    for(size_t i=0;i<value.size();++i)
+      value[i] = char(std::tolower(static_cast<unsigned char>(value[i]))) ;
+    return value ;
+  }
+
+  inline int amrRequestCommandFromName(const std::string &command,
+                                       const std::string &context)
+  {
+    const std::string value = amrLowerString(command) ;
+    if(value == "refine" || value == "refinement")
+      return AMR_REQUEST_REFINE ;
+    if(value == "coarsen" || value == "coarsening" ||
+       value == "derefine" || value == "de-refine")
+      return AMR_REQUEST_COARSEN ;
+    if(value == "none" || value == "keep" || value == "unchanged")
+      return AMR_REQUEST_NONE ;
+
+    if(MPI_rank == 0) {
+      std::cerr << "ERROR: Unknown AMR request command '" << command
+                << "' for " << context << std::endl ;
+    }
+    Abort() ;
+    return AMR_REQUEST_NONE ;
+  }
+
+  inline int amrGetRequestCommandOption(const options_list &options,
+                                        const std::string &option,
+                                        int defaultValue,
+                                        const std::string &context)
+  {
+    if(!options.optionExists(option))
+      return defaultValue ;
+
+    option_value_type valueType = options.getOptionValueType(option) ;
+    if(valueType == REAL)
+      return amrNormalizeRequestCommand(
+        amrGetOptionInt(options,option,defaultValue,context)) ;
+    if(valueType == NAME || valueType == STRING)
+      return amrRequestCommandFromName(
+        amrGetOptionName(options,option,"none",context),context) ;
+
+    if(MPI_rank == 0) {
+      std::cerr << "ERROR: AMR option '" << option << "' for " << context
+                << " must be a request command" << std::endl ;
+    }
+    Abort() ;
+    return defaultValue ;
+  }
+
+  /// Parsed description of one adaptSensorMetrics entry. The field names the
+  /// solver variable; type and kernel select the module rule family; weight
+  /// scales the normalized metric before it enters totScaledError.
+  struct AMRMetricInputSpec {
+    std::string field ;
+    std::string type ;
+    std::string kernel ;
+    double weight ;
+    bool enabled ;
+
+    AMRMetricInputSpec() :
+      field(), type("scalar"), kernel("faceJump"), weight(1.0),
+      enabled(true)
+    {}
+  } ;
+
+  /// Parsed description of one constant request source. These sources are meant
+  /// for debug and regression cases that need to exercise request fusion without
+  /// depending on a solver-specific sensor rule.
+  struct AMRConstantRequestSourceSpec {
+    std::string name ;
+    std::string kind ;
+    int sourceID ;
+    int priority ;
+    int command ;
+    bool hardConstraint ;
+    bool enabled ;
+
+    AMRConstantRequestSourceSpec() :
+      name(), kind("constant"), sourceID(-1), priority(0),
+      command(AMR_REQUEST_NONE), hardConstraint(false), enabled(true)
+    {}
+  } ;
+
+  /// Parsed description of one boundary-distance request source. The boundary
+  /// name comes from the mesh boundary table; thresholds use a negative value to
+  /// mean disabled.
+  struct AMRBoundaryDistanceSourceSpec {
+    std::string name ;
+    std::string boundary ;
+    std::string kind ;
+    int sourceID ;
+    int priority ;
+    bool hardConstraint ;
+    double refineLessThan ;
+    double refineGreaterThan ;
+    double coarsenLessThan ;
+    double coarsenGreaterThan ;
+    bool enabled ;
+
+    AMRBoundaryDistanceSourceSpec() :
+      name(), boundary(), kind("geometry"), sourceID(-1), priority(0),
+      hardConstraint(false), refineLessThan(-1.0), refineGreaterThan(-1.0),
+      coarsenLessThan(-1.0), coarsenGreaterThan(-1.0), enabled(true)
+    {}
+  } ;
+
+  inline void createAMRRequestSourceFacts(fact_db &facts,
+                                          const std::string &name,
+                                          int sourceID,
+                                          int priority,
+                                          const std::string &kind,
+                                          bool hardConstraint) ;
+
+  inline void createAMRBoundaryDistanceSourceFacts(
+    fact_db &facts,
+    const std::string &name,
+    const std::string &boundary,
+    int sourceID,
+    int priority,
+    const std::string &kind,
+    bool hardConstraint,
+    double refineLessThan,
+    double refineGreaterThan,
+    double coarsenLessThan,
+    double coarsenGreaterThan) ;
+
+  inline void createAMRBoundaryDistanceSourceFacts(
+    fact_db &facts,
+    const std::string &name,
+    const std::string &boundary,
+    int sourceID,
+    int priority,
+    bool hardConstraint,
+    double refineLessThan,
+    double refineGreaterThan,
+    double coarsenLessThan,
+    double coarsenGreaterThan) ;
+
+  /// Parse one top-level adaptSensorMetrics option. Supported concise forms are:
+  /// field, field=weight, field=kernel, field=[type=...,kernel=...,weight=...],
+  /// and field=kernel(type=...,weight=...).
+  inline AMRMetricInputSpec parseAMRMetricInputSpec(const options_list &metrics,
+                                                    const std::string &field)
+  {
+    AMRMetricInputSpec spec ;
+    spec.field = field ;
+
+    option_value_type valueType = metrics.getOptionValueType(field) ;
+    if(valueType == BOOLEAN) {
+      bool enabled = true ;
+      metrics.getOption(field,enabled) ;
+      if(!enabled) {
+        spec.enabled = false ;
+      }
+      return spec ;
+    } else if(valueType == REAL) {
+      metrics.getOption(field,spec.weight) ;
+    } else if(valueType == LIST) {
+      options_list::arg_list valueList ;
+      metrics.getOption(field,valueList) ;
+      options_list options = amrOptionsFromList(valueList,field) ;
+      spec.type = amrGetOptionName(options,"type",spec.type,field) ;
+      spec.kernel = amrGetOptionName(options,"kernel",spec.kernel,field) ;
+      spec.weight = amrGetOptionDouble(options,"weight",spec.weight,field) ;
+    } else if(valueType == FUNCTION) {
+      std::string kernel ;
+      options_list::arg_list valueList ;
+      metrics.getOption(field,kernel,valueList) ;
+      spec.kernel = kernel ;
+      options_list options = amrOptionsFromList(valueList,field) ;
+      spec.type = amrGetOptionName(options,"type",spec.type,field) ;
+      spec.weight = amrGetOptionDouble(options,"weight",spec.weight,field) ;
+    } else if(valueType == NAME || valueType == STRING) {
+      option_values optionValue = metrics.getOption(field) ;
+      optionValue.get_value(spec.kernel) ;
+    } else {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: Unable to interpret adaptSensorMetrics entry '"
+                  << field << "'" << std::endl ;
+      }
+      Abort() ;
+    }
+
+    if(spec.weight < 0.0) {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: Negative AMR sensor weight for '" << field
+                  << "'" << std::endl ;
+      }
+      Abort() ;
+    }
+
+    return spec ;
+  }
+
+  /// Parse one top-level amrConstantRequestSources option. Supported forms are
+  /// source=refine, source=coarsen, source=0, and
+  /// source=[command=coarsen,id=20,priority=10,kind=debug,hard=false].
+  inline AMRConstantRequestSourceSpec parseAMRConstantRequestSourceSpec(
+    const options_list &sources,const std::string &name)
+  {
+    AMRConstantRequestSourceSpec spec ;
+    spec.name = name ;
+
+    option_value_type valueType = sources.getOptionValueType(name) ;
+    if(valueType == BOOLEAN) {
+      bool enabled = true ;
+      sources.getOption(name,enabled) ;
+      spec.enabled = enabled ;
+      return spec ;
+    } else if(valueType == REAL) {
+      double value = 0.0 ;
+      sources.getOption(name,value) ;
+      spec.command = amrNormalizeRequestCommand(int(value)) ;
+    } else if(valueType == NAME || valueType == STRING) {
+      option_values optionValue = sources.getOption(name) ;
+      std::string command ;
+      optionValue.get_value(command) ;
+      spec.command = amrRequestCommandFromName(command,name) ;
+    } else if(valueType == LIST) {
+      options_list::arg_list valueList ;
+      sources.getOption(name,valueList) ;
+      options_list options = amrOptionsFromList(valueList,name) ;
+      spec.command = amrGetRequestCommandOption(options,"command",
+                                                spec.command,name) ;
+      spec.sourceID = amrGetOptionInt(options,"id",spec.sourceID,name) ;
+      spec.priority = amrGetOptionInt(options,"priority",
+                                      spec.priority,name) ;
+      spec.kind = amrGetOptionName(options,"kind",spec.kind,name) ;
+      spec.hardConstraint = amrGetOptionBool(options,"hard",
+                                             spec.hardConstraint,name) ;
+      spec.enabled = amrGetOptionBool(options,"enabled",spec.enabled,name) ;
+    } else {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: Unable to interpret amrConstantRequestSources "
+                  << "entry '" << name << "'" << std::endl ;
+      }
+      Abort() ;
+    }
+
+    if(spec.command == AMR_REQUEST_NONE)
+      spec.enabled = false ;
+    return spec ;
+  }
+
+  inline double amrGetDistanceThresholdOption(const options_list &options,
+                                              const std::string &longName,
+                                              const std::string &shortName,
+                                              double defaultValue,
+                                              const std::string &context)
+  {
+    double value = defaultValue ;
+    if(options.optionExists(longName))
+      value = amrGetOptionDouble(options,longName,value,context) ;
+    if(options.optionExists(shortName))
+      value = amrGetOptionDouble(options,shortName,value,context) ;
+    return value ;
+  }
+
+  /// Parse one boundary-distance source option. Supported form:
+  /// source=[boundary=cylinder,id=2,priority=20,refineLessThan=0.002,
+  ///         coarsenGreaterThan=0.006].
+  inline AMRBoundaryDistanceSourceSpec
+  parseAMRBoundaryDistanceSourceSpec(const options_list &sources,
+                                     const std::string &name)
+  {
+    AMRBoundaryDistanceSourceSpec spec ;
+    spec.name = name ;
+
+    option_value_type valueType = sources.getOptionValueType(name) ;
+    if(valueType == BOOLEAN) {
+      bool enabled = true ;
+      sources.getOption(name,enabled) ;
+      spec.enabled = enabled ;
+      return spec ;
+    } else if(valueType == NAME || valueType == STRING) {
+      option_values optionValue = sources.getOption(name) ;
+      optionValue.get_value(spec.boundary) ;
+    } else if(valueType == LIST) {
+      options_list::arg_list valueList ;
+      sources.getOption(name,valueList) ;
+      options_list options = amrOptionsFromList(valueList,name) ;
+      spec.boundary = amrGetOptionName(options,"boundary",spec.boundary,name) ;
+      spec.sourceID = amrGetOptionInt(options,"id",spec.sourceID,name) ;
+      spec.priority = amrGetOptionInt(options,"priority",
+                                      spec.priority,name) ;
+      spec.kind = amrGetOptionName(options,"kind",spec.kind,name) ;
+      spec.hardConstraint = amrGetOptionBool(options,"hard",
+                                             spec.hardConstraint,name) ;
+      spec.enabled = amrGetOptionBool(options,"enabled",spec.enabled,name) ;
+      spec.refineLessThan =
+        amrGetDistanceThresholdOption(options,"refineLessThan","refineLT",
+                                      spec.refineLessThan,name) ;
+      spec.refineGreaterThan =
+        amrGetDistanceThresholdOption(options,"refineGreaterThan","refineGT",
+                                      spec.refineGreaterThan,name) ;
+      spec.coarsenLessThan =
+        amrGetDistanceThresholdOption(options,"coarsenLessThan","coarsenLT",
+                                      spec.coarsenLessThan,name) ;
+      spec.coarsenGreaterThan =
+        amrGetDistanceThresholdOption(options,"coarsenGreaterThan","coarsenGT",
+                                      spec.coarsenGreaterThan,name) ;
+    } else {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: Unable to interpret "
+                  << "AMR boundary distance source '" << name << "'"
+                  << std::endl ;
+      }
+      Abort() ;
+    }
+
+    if(spec.enabled && spec.boundary == "") {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: AMR boundary distance source '" << name
+                  << "' requires a boundary name" << std::endl ;
+      }
+      Abort() ;
+    }
+
+    return spec ;
+  }
+
+  /// Return the scalar metric store produced by the selected module kernel. The
+  /// current module-owned kernel is faceJump for scalar, vector, and mvector
+  /// solver fields.
+  inline std::string amrMetricStoreName(const AMRMetricInputSpec &spec)
+  {
+    if(spec.kernel != "faceJump") {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: Unknown AMR sensor kernel '" << spec.kernel
+                  << "' for field '" << spec.field << "'" << std::endl ;
+      }
+      Abort() ;
+    }
+
+    if(spec.type == "scalar")
+      return amrParametricName("amrScalarFaceJump",spec.field) ;
+    if(spec.type == "vector" || spec.type == "v3d")
+      return amrParametricName("amrVectorFaceJump",spec.field) ;
+    if(spec.type == "mvector" || spec.type == "storeVec")
+      return amrParametricName("amrMVectorFaceJump",spec.field) ;
+
+    if(MPI_rank == 0) {
+      std::cerr << "ERROR: Unknown AMR sensor field type '" << spec.type
+                << "' for field '" << spec.field << "'" << std::endl ;
+    }
+    Abort() ;
+    return "" ;
+  }
+
+  /// Create selector facts that instantiate the requested metric rule family,
+  /// then select the generated scalar metric for the scaled-error source.
+  inline void createAMRMetricInputFacts(fact_db &facts,
+                                        const AMRMetricInputSpec &spec)
+  {
+    std::string selector ;
+    if(spec.type == "scalar") {
+      selector = amrParametricName("amrUseScalarFaceJump",spec.field) ;
+    } else if(spec.type == "vector" || spec.type == "v3d") {
+      selector = amrParametricName("amrUseVectorFaceJump",spec.field) ;
+    } else if(spec.type == "mvector" || spec.type == "storeVec") {
+      selector = amrParametricName("amrUseMVectorFaceJump",spec.field) ;
+    } else {
+      amrMetricStoreName(spec) ;
+    }
+
+    createAMRBoolFact(facts,selector) ;
+    createAdaptSensorFact(facts,amrMetricStoreName(spec),spec.weight) ;
+  }
+
+  inline void createAMRConstantRequestSourceFacts(
+    fact_db &facts,const AMRConstantRequestSourceSpec &spec)
+  {
+    createAMRRequestSourceFacts(facts,spec.name,spec.sourceID,
+                                spec.priority,spec.kind,
+                                spec.hardConstraint) ;
+    createAMRBoolFact(facts,
+                      amrParametricName("amrConstantRequestSource",
+                                        spec.name)) ;
+    createAMRIntFact(facts,
+                     amrParametricName("amrConstantRequestCommand",
+                                       spec.name),
+                     spec.command) ;
+  }
+
+  inline void setupAMRBoundaryDistanceSourceFacts(fact_db &facts,
+                                                  const std::string &optionName,
+                                                  int &nextSourceID)
+  {
+    storeRepP boundarySourcePtr = facts.get_variable(optionName) ;
+    if(boundarySourcePtr == 0)
+      return ;
+
+    param<options_list> boundarySources ;
+    boundarySources = boundarySourcePtr ;
+
+    options_list::option_namelist sourceNames =
+      (*boundarySources).getOptionNameList() ;
+    for(options_list::option_namelist::const_iterator
+        si=sourceNames.begin();si!=sourceNames.end();++si) {
+      AMRBoundaryDistanceSourceSpec spec =
+        parseAMRBoundaryDistanceSourceSpec(*boundarySources,*si) ;
+      if(!spec.enabled)
+        continue ;
+      if(spec.sourceID < 0)
+        spec.sourceID = nextSourceID ;
+      nextSourceID = std::max(nextSourceID,spec.sourceID+1) ;
+      createAMRBoundaryDistanceSourceFacts(
+        facts,spec.name,spec.boundary,spec.sourceID,spec.priority,spec.kind,
+        spec.hardConstraint,spec.refineLessThan,spec.refineGreaterThan,
+        spec.coarsenLessThan,spec.coarsenGreaterThan) ;
+    }
+  }
+
+  /// Historical setup helper for FVMAMR facts. Call during fact-database setup,
+  /// before building an AMR-capable query schedule. Sensor and constant-source
+  /// expansion can run after vars facts are loaded; boundary-distance sources
+  /// require grid/boundary facts and should be expanded after those facts exist.
+  inline void setupAdaptSensorFacts(fact_db &facts)
+  {
+    storeRepP asensor = facts.get_variable("adaptSensor") ;
+    if(asensor != 0) {
+      param<std::string> adaptSensor ;
+      adaptSensor = asensor ;
+      const std::string sensorList = *adaptSensor ;
+
+      if(sensorList != "") {
+        exprP ep = expression::create(sensorList) ;
+        if(ep == 0) {
+          if(MPI_rank == 0)
+            std::cerr << "ERROR: Unable to interpret expression in 'adaptSensor'"
+                      << std::endl ;
+          Abort() ;
+        }
+
+        exprList sensors = collect_associative_op(ep,OP_COMMA) ;
+        for(exprList::const_iterator li=sensors.begin();li!=sensors.end();++li) {
+          if((*li)->op != OP_NAME) {
+            if(MPI_rank == 0) {
+              std::cerr << "ERROR: Unable to interpret expression in 'adaptSensor'"
+                        << std::endl ;
+              (*li)->Print(std::cerr) ;
+            }
+            Abort() ;
+          }
+          createAdaptSensorFact(facts,(*li)->name) ;
+        }
+      }
+    }
+
+    storeRepP metricPtr = facts.get_variable("adaptSensorMetrics") ;
+    if(metricPtr != 0) {
+      param<options_list> adaptSensorMetrics ;
+      adaptSensorMetrics = metricPtr ;
+
+      options_list::option_namelist metricNames =
+        (*adaptSensorMetrics).getOptionNameList() ;
+      for(options_list::option_namelist::const_iterator
+          mi=metricNames.begin();mi!=metricNames.end();++mi) {
+        AMRMetricInputSpec spec =
+          parseAMRMetricInputSpec(*adaptSensorMetrics,*mi) ;
+        if(!spec.enabled || spec.weight == 0.0)
+          continue ;
+        createAMRMetricInputFacts(facts,spec) ;
+      }
+    }
+
+    storeRepP constantSourcePtr =
+      facts.get_variable("amrConstantRequestSources") ;
+    if(constantSourcePtr != 0) {
+      param<options_list> constantSources ;
+      constantSources = constantSourcePtr ;
+
+      options_list::option_namelist sourceNames =
+        (*constantSources).getOptionNameList() ;
+      int nextSourceID = 1000 ;
+      for(options_list::option_namelist::const_iterator
+          si=sourceNames.begin();si!=sourceNames.end();++si) {
+        AMRConstantRequestSourceSpec spec =
+          parseAMRConstantRequestSourceSpec(*constantSources,*si) ;
+        if(!spec.enabled)
+          continue ;
+        if(spec.sourceID < 0)
+          spec.sourceID = nextSourceID ;
+        nextSourceID = std::max(nextSourceID,spec.sourceID+1) ;
+        createAMRConstantRequestSourceFacts(facts,spec) ;
+      }
+    }
+
+    int nextBoundarySourceID = 2000 ;
+    setupAMRBoundaryDistanceSourceFacts(facts,"amrBoundaryDistanceSources",
+                                        nextBoundarySourceID) ;
+    setupAMRBoundaryDistanceSourceFacts(facts,
+                                        "amrNamedBoundaryDistanceSources",
+                                        nextBoundarySourceID) ;
+  }
+
+  /// Clearer alias for setupAdaptSensorFacts(). New solver code may call this
+  /// name; setupAdaptSensorFacts() remains for existing Stream/Chem-style setup.
+  inline void setupFVMAMRFacts(fact_db &facts)
+  {
+    setupAdaptSensorFacts(facts) ;
+  }
+
+  /// Create setup facts that register one AMR request source for parametric
+  /// rules. This is a schedule-construction operation, not a rule to call from
+  /// inside a running Loci schedule. sourceID must be unique across active
+  /// sources because selected requests are recovered by id, but this helper does
+  /// not validate global uniqueness. Existing facts are preserved. kind and
+  /// hardConstraint are diagnostics/future-policy metadata for the stock .loci
+  /// schedule.
+  inline void createAMRRequestSourceFacts(fact_db &facts,
+                                          const std::string &name,
+                                          int sourceID,
+                                          int priority,
+                                          const std::string &kind,
+                                          bool hardConstraint)
+  {
+    const std::string prefix = std::string("(") + name + std::string(")") ;
+
+    const std::string sourceVar =
+      std::string("amrRequestSource") + prefix ;
+    if(facts.get_variable(sourceVar) == 0) {
+      param<bool> source ;
+      *source = true ;
+      facts.create_fact(sourceVar,source) ;
+    }
+
+    const std::string idVar = std::string("amrSourceID") + prefix ;
+    if(facts.get_variable(idVar) == 0) {
+      param<int> id ;
+      *id = sourceID ;
+      facts.create_fact(idVar,id) ;
+    }
+
+    const std::string priorityVar =
+      std::string("amrSourcePriority") + prefix ;
+    if(facts.get_variable(priorityVar) == 0) {
+      param<int> sourcePriority ;
+      *sourcePriority = priority ;
+      facts.create_fact(priorityVar,sourcePriority) ;
+    }
+
+    const std::string kindVar = std::string("amrSourceKind") + prefix ;
+    if(facts.get_variable(kindVar) == 0) {
+      param<std::string> sourceKind ;
+      *sourceKind = kind ;
+      facts.create_fact(kindVar,sourceKind) ;
+    }
+
+    const std::string hardVar =
+      std::string("amrSourceHardConstraint") + prefix ;
+    if(facts.get_variable(hardVar) == 0) {
+      param<bool> hard ;
+      *hard = hardConstraint ;
+      facts.create_fact(hardVar,hard) ;
+    }
+  }
+
+  /// Register a source that converts a precomputed distance store into AMR
+  /// requests. A solver rule or boundary-distance helper must provide
+  /// amrDistanceToTarget(name). Negative
+  /// thresholds are disabled; if all thresholds are negative the source emits
+  /// keep. If refine and coarsen tests both match, refinement wins in the live
+  /// distance rule.
+  inline void createAMRDistanceRequestSourceFacts(
+    fact_db &facts,
+    const std::string &name,
+    int sourceID,
+    int priority,
+    const std::string &kind,
+    bool hardConstraint,
+    double refineLessThan = -1.0,
+    double refineGreaterThan = -1.0,
+    double coarsenLessThan = -1.0,
+    double coarsenGreaterThan = -1.0,
+    const std::string &targetName = "")
+  {
+    createAMRRequestSourceFacts(facts,name,sourceID,priority,kind,
+                                hardConstraint) ;
+    createAMRBoolFact(facts,
+                      amrParametricName("amrDistanceRequestSource",name)) ;
+    createAMRDoubleFact(facts,
+                        amrParametricName("amrDistanceRefineLessThan",name),
+                        refineLessThan) ;
+    createAMRDoubleFact(facts,
+                        amrParametricName("amrDistanceRefineGreaterThan",name),
+                        refineGreaterThan) ;
+    createAMRDoubleFact(facts,
+                        amrParametricName("amrDistanceCoarsenLessThan",name),
+                        coarsenLessThan) ;
+    createAMRDoubleFact(facts,
+                        amrParametricName("amrDistanceCoarsenGreaterThan",
+                                          name),
+                        coarsenGreaterThan) ;
+    if(targetName != "") {
+      createAMRStringFact(facts,
+                          amrParametricName("amrDistanceTargetName",name),
+                          targetName) ;
+    }
+  }
+
+  inline storeRepP amrRequireFact(fact_db &facts,const std::string &name,
+                                  const std::string &context)
+  {
+    storeRepP fact = facts.get_variable(name) ;
+    if(fact == 0) {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: AMR helper '" << context
+                  << "' requires fact '" << name << "'" << std::endl ;
+      }
+      Abort() ;
+    }
+    return fact ;
+  }
+
+  /// Return the faces belonging to one mesh boundary name.
+  inline entitySet createAMRBoundaryFaceSet(fact_db &facts,
+                                            const std::string &source,
+                                            const std::string &boundary)
+  {
+    const std::string context =
+      std::string("createAMRBoundaryFaceSet(") + source + ")" ;
+
+    storeRepP refRep = amrRequireFact(facts,"ref",context) ;
+    storeRepP boundaryNamesRep =
+      amrRequireFact(facts,"boundary_names",context) ;
+    storeRepP boundaryFacesRep =
+      amrRequireFact(facts,"boundary_faces",context) ;
+    constraint boundaryFaces ;
+    boundaryFaces = boundaryFacesRep ;
+
+    entitySet targetFaces =
+      get_boundary_faces(boundary,refRep,boundaryNamesRep,*boundaryFaces) ;
+    if(!GLOBAL_OR(targetFaces.size() != 0)) {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: AMR boundary distance source '" << source
+                  << "' could not find boundary '" << boundary << "'"
+                  << std::endl ;
+      }
+      Abort() ;
+    }
+
+    return targetFaces ;
+  }
+
+  /// Build a cell-to-nearest-face map for one named boundary. The search uses
+  /// face centers and mirrors the volume-tag partitioning used by Stream's
+  /// wall-distance setup so disconnected volume regions do not search each
+  /// other's boundary faces.
+  inline storeRepP createAMRClosestBoundaryFaceMap(fact_db &facts,
+                                                   const std::string &source,
+                                                   const std::string &boundary)
+  {
+    const std::string context =
+      std::string("createAMRClosestBoundaryFaceMap(") + source + ")" ;
+
+    const std::string boundaryFacesVar =
+      amrParametricName("amrBoundaryFaces",source) ;
+    entitySet targetFaces ;
+    storeRepP targetFacesRep = facts.get_variable(boundaryFacesVar) ;
+    if(targetFacesRep != 0) {
+      constraint targetBoundaryFaces ;
+      targetBoundaryFaces = targetFacesRep ;
+      targetFaces = *targetBoundaryFaces ;
+    } else {
+      targetFaces = createAMRBoundaryFaceSet(facts,source,boundary) ;
+    }
+
+    multiMap face2node(amrRequireFact(facts,"face2node",context)) ;
+    store<vect3d> posStatic(amrRequireFact(facts,"pos",context)) ;
+    entitySet faceDomain = face2node.domain() ;
+
+    dstore<vect3d> pos ;
+    FORALL(posStatic.domain(),pi) {
+      pos[pi] = posStatic[pi] ;
+    } ENDFORALL ;
+
+    if(MPI_processes > 1) {
+      entitySet totalDom = pos.domain() ;
+      totalDom += MapRepP(face2node.Rep())->image(faceDomain) ;
+      entitySet outDom = totalDom-pos.domain() ;
+      storeRepP posRep = pos.Rep() ;
+      fill_clone(posRep,outDom,facts.get_init_ptn()) ;
+    }
+
+    dstore<vect3d> facecenter ;
+    dstore<real_t> faceArea ;
+    FORALL(faceDomain,fc) {
+      vect3d nodesum(0.0,0.0,0.0) ;
+      real_t lensum = 0 ;
+      const int fsz = face2node[fc].size() ;
+      for(int id=0;id<fsz;++id) {
+        const int nd1 = id ;
+        const int nd2 = (id+1 == fsz)?0:id+1 ;
+        const vect3d p1 = pos[face2node[fc][nd1]] ;
+        const vect3d p2 = pos[face2node[fc][nd2]] ;
+        const vect3d edgeCenter = 0.5*(p1+p2) ;
+        const real_t len = norm(p1-p2) ;
+        nodesum += len*edgeCenter ;
+        lensum += len ;
+      }
+
+      const vect3d center = nodesum/lensum ;
+      facecenter[fc] = center ;
+
+      vect3d areaSum(0.0,0.0,0.0) ;
+      for(int id=0;id<fsz;++id) {
+        const int nd1 = id ;
+        const int nd2 = (id+1 == fsz)?0:id+1 ;
+        const vect3d p1 = pos[face2node[fc][nd1]] ;
+        const vect3d p2 = pos[face2node[fc][nd2]] ;
+        areaSum += cross(p1-center,p2-center) ;
+      }
+      faceArea[fc] = 0.5*norm(areaSum) ;
+    } ENDFORALL ;
+    pos.setRep(dstore<vect3d>().Rep()) ;
+
+    multiMap upper(amrRequireFact(facts,"upper",context)) ;
+    multiMap lower(amrRequireFact(facts,"lower",context)) ;
+    multiMap boundaryMap(amrRequireFact(facts,"boundary_map",context)) ;
+    constraint geomCells ;
+    geomCells = amrRequireFact(facts,"geom_cells",context) ;
+
+#ifdef LOCI_HAS_STATIC_KEYSPACE
+    const int faceKeySpace = face2node.Rep()->getDomainKeySpace() ;
+#endif
+
+    if(MPI_processes > 1) {
+      entitySet faceOut = faceDomain ;
+      faceOut += MapRepP(lower.Rep())->image(*geomCells) ;
+      faceOut += MapRepP(boundaryMap.Rep())->image(*geomCells) ;
+      faceOut += MapRepP(upper.Rep())->image(*geomCells) ;
+      storeRepP facecenterRep = facecenter.Rep() ;
+      storeRepP faceAreaRep = faceArea.Rep() ;
+#ifdef LOCI_HAS_STATIC_KEYSPACE
+      std::vector<entitySet> initPtn = facts.get_init_ptn(faceKeySpace) ;
+#else
+      std::vector<entitySet> initPtn = facts.get_init_ptn() ;
+#endif
+      fill_clone(facecenterRep,faceOut,initPtn) ;
+      fill_clone(faceAreaRep,faceOut,initPtn) ;
+    }
+
+    store<vect3d> cellcenter ;
+    cellcenter.allocate(*geomCells) ;
+    FORALL(*geomCells,cc) {
+      vect3d nodesum(0.0,0.0,0.0) ;
+      real_t areasum = 0 ;
+      for(Entity *id=upper.begin(cc);id!=upper.end(cc);++id) {
+        const real_t w = faceArea[*id] ;
+        nodesum += facecenter[*id]*w ;
+        areasum += w ;
+      }
+      for(Entity *id=lower.begin(cc);id!=lower.end(cc);++id) {
+        const real_t w = faceArea[*id] ;
+        nodesum += facecenter[*id]*w ;
+        areasum += w ;
+      }
+      for(Entity *id=boundaryMap.begin(cc);id!=boundaryMap.end(cc);++id) {
+        const real_t w = faceArea[*id] ;
+        nodesum += facecenter[*id]*w ;
+        areasum += w ;
+      }
+      cellcenter[cc] = nodesum/areasum ;
+    } ENDFORALL ;
+
+    std::map<std::string,entitySet> volumeSets ;
+    variableSet vars = facts.get_extensional_facts() ;
+    for(variableSet::const_iterator vi=vars.begin();vi!=vars.end();++vi) {
+      variable var(*vi) ;
+      if(var.get_arg_list().size() > 0 && var.get_info().name == "volumeTag") {
+        param<std::string> volumeName(facts.get_variable(*vi)) ;
+        std::ostringstream varName ;
+        varName << *vi ;
+        volumeSets[varName.str()] = volumeName.domain() ;
+      }
+    }
+    if(volumeSets.empty())
+      volumeSets["volumeTag(Main)"] = ~EMPTY ;
+
+    std::vector<entitySet> volumeCellSets ;
+    for(std::map<std::string,entitySet>::const_iterator vi=volumeSets.begin();
+        vi!=volumeSets.end();++vi)
+      volumeCellSets.push_back(all_collect_entitySet(vi->second)) ;
+
+    Map cl(amrRequireFact(facts,"cl",context)) ;
+    std::map<int,int> closestByCell ;
+    entitySet mapDomain ;
+
+    for(size_t i=0;i<volumeCellSets.size();++i) {
+      entitySet faceSet ;
+      for(entitySet::const_iterator fi=targetFaces.begin();
+          fi!=targetFaces.end();++fi) {
+        if(volumeCellSets[i].inSet(cl[*fi]))
+          faceSet += *fi ;
+      }
+
+      entitySet cellSet = *geomCells & volumeCellSets[i] ;
+      if(!GLOBAL_OR(faceSet.size() != 0))
+        continue ;
+
+      std::vector<kdTree::coord3d> targetPoints(faceSet.size()) ;
+      std::vector<int> targetIDs(faceSet.size()) ;
+      int cnt = 0 ;
+      FORALL(faceSet,fc) {
+        targetPoints[cnt][0] = facecenter[fc].x ;
+        targetPoints[cnt][1] = facecenter[fc].y ;
+        targetPoints[cnt][2] = facecenter[fc].z ;
+        targetIDs[cnt] = fc ;
+        ++cnt ;
+      } ENDFORALL ;
+
+      std::vector<kdTree::coord3d> cellPoints(cellSet.size()) ;
+      std::vector<int> closest(cellSet.size(),-1) ;
+      cnt = 0 ;
+      FORALL(cellSet,cc) {
+        cellPoints[cnt][0] = cellcenter[cc].x ;
+        cellPoints[cnt][1] = cellcenter[cc].y ;
+        cellPoints[cnt][2] = cellcenter[cc].z ;
+        ++cnt ;
+      } ENDFORALL ;
+
+      parallelNearestNeighbors(targetPoints,targetIDs,cellPoints,closest,
+                               MPI_COMM_WORLD) ;
+
+      cnt = 0 ;
+      FORALL(cellSet,cc) {
+        if(closest[cnt] >= 0) {
+          mapDomain += cc ;
+          closestByCell[cc] = closest[cnt] ;
+        }
+        ++cnt ;
+      } ENDFORALL ;
+    }
+
+    if(!GLOBAL_OR(mapDomain.size() != 0)) {
+      if(MPI_rank == 0) {
+        std::cerr << "ERROR: AMR boundary distance source '" << source
+                  << "' could not map any cells to boundary '" << boundary
+                  << "'" << std::endl ;
+      }
+      Abort() ;
+    }
+
+    Map closestFace ;
+    closestFace.allocate(mapDomain) ;
+    FORALL(mapDomain,cc) {
+      closestFace[cc] = closestByCell[cc] ;
+    } ENDFORALL ;
+
+#ifdef LOCI_HAS_STATIC_KEYSPACE
+    MapRepP(closestFace.Rep())->setRangeKeySpace(faceKeySpace) ;
+#endif
+
+    return closestFace.Rep() ;
+  }
+
+  /// Register a distance request source built from the nearest face on a mesh
+  /// boundary. This computes current-mesh boundary-face and closest-face facts
+  /// immediately, so rerun it after remeshing on the rebuilt fact database. The
+  /// boundary argument is the mesh boundary name recorded in boundary_names and
+  /// normally used as a boundary_conditions key.
+  inline void createAMRBoundaryDistanceSourceFacts(
+    fact_db &facts,
+    const std::string &name,
+    const std::string &boundary,
+    int sourceID,
+    int priority,
+    const std::string &kind,
+    bool hardConstraint,
+    double refineLessThan = -1.0,
+    double refineGreaterThan = -1.0,
+    double coarsenLessThan = -1.0,
+    double coarsenGreaterThan = -1.0)
+  {
+    createAMRDistanceRequestSourceFacts(facts,name,sourceID,priority,kind,
+                                        hardConstraint,refineLessThan,
+                                        refineGreaterThan,coarsenLessThan,
+                                        coarsenGreaterThan,boundary) ;
+    createAMRBoolFact(facts,
+                      amrParametricName("amrBoundaryDistanceSource",name)) ;
+
+    const std::string boundaryFacesVar =
+      amrParametricName("amrBoundaryFaces",name) ;
+    if(facts.get_variable(boundaryFacesVar) == 0) {
+      entitySet targetFaces =
+        createAMRBoundaryFaceSet(facts,name,boundary) ;
+      storeRepP boundaryFacesRep =
+        amrRequireFact(facts,"boundary_faces",
+                       "createAMRBoundaryDistanceSourceFacts") ;
+      createAMRConstraintFact(facts,boundaryFacesVar,targetFaces,
+                              boundaryFacesRep->getDomainKeySpace()) ;
+    }
+
+    const std::string closestVar =
+      amrParametricName("amrClosestBoundaryFace",name) ;
+    if(facts.get_variable(closestVar) == 0) {
+      storeRepP closest =
+        createAMRClosestBoundaryFaceMap(facts,name,boundary) ;
+      facts.create_fact(closestVar,closest) ;
+    }
+  }
+
+  inline void createAMRBoundaryDistanceSourceFacts(
+    fact_db &facts,
+    const std::string &name,
+    const std::string &boundary,
+    int sourceID,
+    int priority,
+    bool hardConstraint,
+    double refineLessThan = -1.0,
+    double refineGreaterThan = -1.0,
+    double coarsenLessThan = -1.0,
+    double coarsenGreaterThan = -1.0)
+  {
+    createAMRBoundaryDistanceSourceFacts(
+      facts,name,boundary,sourceID,priority,"geometry",hardConstraint,
+      refineLessThan,refineGreaterThan,coarsenLessThan,coarsenGreaterThan) ;
+  }
+
+  /// Compatibility function name. It delegates to the canonical boundary helper
+  /// and emits amrBoundaryDistanceSource(SRC), not the older selector spelling.
+  inline void createAMRNamedBoundaryDistanceRequestSourceFacts(
+    fact_db &facts,
+    const std::string &name,
+    const std::string &boundary,
+    int sourceID,
+    int priority,
+    bool hardConstraint,
+    double refineLessThan = -1.0,
+    double refineGreaterThan = -1.0,
+    double coarsenLessThan = -1.0,
+    double coarsenGreaterThan = -1.0)
+  {
+    createAMRBoundaryDistanceSourceFacts(
+      facts,name,boundary,sourceID,priority,"geometry",hardConstraint,
+      refineLessThan,refineGreaterThan,coarsenLessThan,coarsenGreaterThan) ;
   }
 
   /// Redistribute a local cell store into the file-order distribution expected
@@ -567,6 +2453,18 @@ namespace Loci {
   } ;
 }
 
+  /// Convenience macros that register solver-specific transfer and restart rules.
+  /// The solver supplies every Loci variable name, database key, constraint, and
+  /// conditional so FVMAMR does not assume a particular physics package or time
+  /// naming convention. Restart rules consume and delete their DataXFER_DB key
+  /// after interpolation, so each restarted output should use a unique key unless
+  /// the solver intentionally implements shared consumption.
+  ///
+  /// Transfer macros stage CURRENT_VAR and PREVIOUS_VAR into CURRENT_KEY and
+  /// PREVIOUS_KEY when CONDITIONAL_NAME is true on DOMAIN_CONSTRAINT. OUTPUT_NAME
+  /// is only the synthetic query target for the staging rule. Restart macros read
+  /// DB_KEY, write OUTPUT_VAR, run on RESTART_CONSTRAINT and DOMAIN_CONSTRAINT,
+  /// and use RESTART_FLAG and MAPPING_NAME as input dependencies.
 #define FVMAMR_TRANSFER_SCALAR_RULE(RULE_NAME,CURRENT_VAR,PREVIOUS_VAR, \
                                     CURRENT_KEY,PREVIOUS_KEY, \
                                     CONSTRAINT_NAME,CONDITIONAL_NAME, \

@@ -1,0 +1,126 @@
+//#############################################################################
+//#
+//# Copyright 2026, Mississippi State University
+//#
+//# This file is part of the Loci Framework.
+//#
+//# The Loci Framework is free software: you can redistribute it and/or modify
+//# it under the terms of the Lesser GNU General Public License as published by
+//# the Free Software Foundation, either version 3 of the License, or
+//# (at your option) any later version.
+//#
+//# The Loci Framework is distributed in the hope that it will be useful,
+//# but WITHOUT ANY WARRANTY; without even the implied warranty of
+//# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//# Lesser GNU General Public License for more details.
+//#
+//# You should have received a copy of the Lesser GNU General Public License
+//# along with the Loci Framework.  If not, see <http://www.gnu.org/licenses>
+//#
+//#############################################################################
+#include <Loci.h>
+#include <FVMAMR/amr.h>
+
+$include "FVM.lh"
+$include "FVMAMR/amr.lh"
+
+namespace Loci {
+
+  //---------------------------------------------------------------------------
+  // Distance-based request sources
+
+  /// Structured selector for distance sources built from mesh boundaries.
+  $rule optional(amrBoundaryDistanceSources) {
+    $amrBoundaryDistanceSources = options_list() ;
+  }
+
+  /// Backward-compatible selector name for boundary distance sources.
+  $rule optional(amrNamedBoundaryDistanceSources) {
+    $amrNamedBoundaryDistanceSources = options_list() ;
+  }
+
+  /// Bridge the older selector spelling to the canonical boundary-distance
+  /// selector so fixed solver rules using the compatibility name still
+  /// instantiate the distance calculation below.
+  $rule default(amrBoundaryDistanceSource(SRC)),
+  parametric(amrNamedBoundaryDistanceSource(SRC)) {
+    $amrBoundaryDistanceSource(SRC) = true ;
+  }
+
+  /// Optional diagnostic name for distance-threshold request sources.
+  $rule default(amrDistanceTargetName(SRC)),
+  parametric(amrDistanceRequestSource(SRC)) {
+    $amrDistanceTargetName(SRC) = "" ;
+  }
+
+  /// Disabled by default; a solver or startup helper enables one or more
+  /// thresholds for each distance source.
+  $rule default(amrDistanceRefineLessThan(SRC)),
+  parametric(amrDistanceRequestSource(SRC)) {
+    $amrDistanceRefineLessThan(SRC) = -1.0 ;
+  }
+
+  /// Disabled by default; refine when distance is greater than this value.
+  $rule default(amrDistanceRefineGreaterThan(SRC)),
+  parametric(amrDistanceRequestSource(SRC)) {
+    $amrDistanceRefineGreaterThan(SRC) = -1.0 ;
+  }
+
+  /// Disabled by default; coarsen when distance is less than this value.
+  $rule default(amrDistanceCoarsenLessThan(SRC)),
+  parametric(amrDistanceRequestSource(SRC)) {
+    $amrDistanceCoarsenLessThan(SRC) = -1.0 ;
+  }
+
+  /// Disabled by default; coarsen when distance is greater than this value.
+  $rule default(amrDistanceCoarsenGreaterThan(SRC)),
+  parametric(amrDistanceRequestSource(SRC)) {
+    $amrDistanceCoarsenGreaterThan(SRC) = -1.0 ;
+  }
+
+  /// Compute the distance for a module-built boundary source. The startup
+  /// helper creates amrClosestBoundaryFace(SRC) by searching the requested
+  /// boundary surface; this rule keeps the distance calculation in Loci's
+  /// mapped-store machinery.
+  $rule pointwise(amrDistanceToTarget(SRC)<-
+  amrClosestBoundaryFace(SRC)->facecenter,cellcenter),
+  parametric(amrBoundaryDistanceSource(SRC)) {
+    $amrDistanceToTarget(SRC) =
+      norm($amrClosestBoundaryFace(SRC)->$facecenter-$cellcenter) ;
+  }
+
+  /// Convert a precomputed distance store into a signed AMR request. The store
+  /// may come from solver rules or from the boundary-distance helper above. If
+  /// all thresholds are disabled the source emits keep; if thresholds overlap,
+  /// refinement wins within this source.
+  $rule pointwise(amrRequest(SRC)<-amrDistanceToTarget(SRC),
+  amrDistanceRefineLessThan(SRC),amrDistanceRefineGreaterThan(SRC),
+  amrDistanceCoarsenLessThan(SRC),amrDistanceCoarsenGreaterThan(SRC)),
+  parametric(amrDistanceRequestSource(SRC)) {
+    const double d = realToDouble($amrDistanceToTarget(SRC)) ;
+    bool refine = false ;
+    bool coarsen = false ;
+
+    if($amrDistanceRefineLessThan(SRC) >= 0.0 &&
+       d < $amrDistanceRefineLessThan(SRC))
+      refine = true ;
+    if($amrDistanceRefineGreaterThan(SRC) >= 0.0 &&
+       d > $amrDistanceRefineGreaterThan(SRC))
+      refine = true ;
+    if($amrDistanceCoarsenLessThan(SRC) >= 0.0 &&
+       d < $amrDistanceCoarsenLessThan(SRC))
+      coarsen = true ;
+    if($amrDistanceCoarsenGreaterThan(SRC) >= 0.0 &&
+       d > $amrDistanceCoarsenGreaterThan(SRC))
+      coarsen = true ;
+
+    if(refine) {
+      $amrRequest(SRC) = 1 ;
+    } else if(coarsen) {
+      $amrRequest(SRC) = -1 ;
+    } else {
+      $amrRequest(SRC) = 0 ;
+    }
+  }
+
+}

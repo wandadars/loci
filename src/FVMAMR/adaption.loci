@@ -68,19 +68,30 @@ namespace Loci {
   /// Face folding criterion used by the FVMAdapt remesher.
   $rule default(adaptFaceFold) { $adaptFaceFold = 1.5708 ; }
 
-  /// Mesh balancing method used to balance refinement levels.
+  /// Reserved compatibility control. The current setup helper does not pass
+  /// adaptBalanceType into FVMAdapt.
   $rule default(adaptBalanceType) { $adaptBalanceType = 0 ; }
 
   /// Solver-side cadence controls.
   $rule optional(adaptFrequency) { $adaptFrequency = 100 ; }
   $rule default(adaptStart) { $adaptStart = 100 ; }
 
-  /// Error thresholds for refinement and de-refinement.
+  /// Error thresholds for refinement and coarsening requests from scaledError.
   $rule default(adaptSensitivity) { $adaptSensitivity = 1.0 ; }
   $rule default(coarsenSensitivity) { $coarsenSensitivity = 0.5 ; }
 
   /// Selects error metrics to use for refinement.
   $rule optional(adaptSensor) { $adaptSensor = "" ; }
+
+  /// Structured selector for module-generated scalar metrics. The startup
+  /// helper expands this options list into the parametric selector facts below.
+  $rule optional(adaptSensorMetrics) { $adaptSensorMetrics = options_list() ; }
+
+  /// Structured selector for constant request sources used by debug and
+  /// regression cases.
+  $rule optional(amrConstantRequestSources) {
+    $amrConstantRequestSources = options_list() ;
+  }
 
   /// Maximum number of cells in adaptation phase, in millions of cells.
   $rule default(maxAdaptCellCount) { $maxAdaptCellCount = -1. ; }
@@ -216,20 +227,47 @@ namespace Loci {
 
   $type ERRVAR store<real> ;
 
-  /// Start with no sensor contribution. With no selected sensors, AMR marking is
-  /// a no-op unless a solver adds its own cellRefFlag contributors.
-  $rule unit(totScaledError),constraint(geom_cells) {
-    $totScaledError = 0 ;
+  /// Count selected sensors contributing to each cell. This keeps the
+  /// scaled-error source inactive when no solver metric has been selected.
+  $rule unit(scaledErrorSensorCount),constraint(geom_cells) {
+    $scaledErrorSensorCount = 0 ;
   }
 
-  /// Add normalized sensor values to the total scaled error. Applications
+  $rule apply(scaledErrorSensorCount<-ERRVAR)[Loci::Summation],
+  parametric(adaptSensor(ERRVAR)) {
+    join($scaledErrorSensorCount,1) ;
+  }
+
+  /// Maximum normalized sensor value before applying the no-sensor guard.
+  $rule unit(maxScaledError),constraint(geom_cells) {
+    $maxScaledError = -std::numeric_limits<real>::max() ;
+  }
+
+  /// Default weight for manually supplied sensor facts.
+  $rule default(adaptSensorWeight(ERRVAR)),
+  parametric(adaptSensor(ERRVAR)) {
+    $adaptSensorWeight(ERRVAR) = 1.0 ;
+  }
+
+  /// Add normalized sensor values to the scaled-error source. Applications
   /// enable a sensor by creating parametric facts named adaptSensor(ERRVAR).
-  $rule apply(totScaledError<-ERRVAR,cellMean(ERRVAR),
-    cellSigmaSq(ERRVAR))[Loci::Maximum],
+  $rule apply(maxScaledError<-ERRVAR,cellMean(ERRVAR),
+    cellSigmaSq(ERRVAR),adaptSensorWeight(ERRVAR))[Loci::Maximum],
   parametric(adaptSensor(ERRVAR)) {
     real sigma = sqrt($cellSigmaSq(ERRVAR)) ;
-    real err_scaled = ($ERRVAR-$cellMean(ERRVAR))/(sigma+1e-30) ;
-    join($totScaledError,err_scaled) ;
+    real err_scaled = $adaptSensorWeight(ERRVAR)*
+      ($ERRVAR-$cellMean(ERRVAR))/(sigma+1e-30) ;
+    join($maxScaledError,err_scaled) ;
+  }
+
+  /// Combined normalized sensor value used by the built-in scaled-error
+  /// request source. With no selected sensors, the source contributes no AMR
+  /// request and the diagnostic value is zero.
+  $rule pointwise(totScaledError<-maxScaledError,scaledErrorSensorCount) {
+    $totScaledError = 0 ;
+    if($scaledErrorSensorCount > 0) {
+      $totScaledError = $maxScaledError ;
+    }
   }
 
   $rule unit(limitedAdaptSensitivity),constraint(geom_cells) {
@@ -238,8 +276,8 @@ namespace Loci {
 
   /// If the requested threshold would exceed the cell-count limit, raise the
   /// effective threshold to the parallel sorted pivot that meets the limit.
-  $rule apply(limitedAdaptSensitivity<-totScaledError,adaptSensitivity,
-    cellAdaptMask,maxRefineCellCount)[Loci::NullOp],
+  $rule apply(limitedAdaptSensitivity<-totScaledError,scaledErrorSensorCount,
+    adaptSensitivity,cellAdaptMask,maxRefineCellCount)[Loci::NullOp],
   option(disable_threading),prelude {
     double sensitivity = *$adaptSensitivity ;
     *$limitedAdaptSensitivity = sensitivity ;
@@ -247,7 +285,8 @@ namespace Loci {
     int cnt = 0 ;
     entitySet domain = entitySet(seq) ;
     FORALL(domain,ii) {
-      if($cellAdaptMask[ii] == 0 && $totScaledError[ii] > sensitivity)
+      if($scaledErrorSensorCount[ii] > 0 && $cellAdaptMask[ii] == 0 &&
+         $totScaledError[ii] > sensitivity)
         cnt++ ;
     } ENDFORALL ;
 
@@ -262,7 +301,8 @@ namespace Loci {
       vector<double> errorList(cnt) ;
       cnt = 0 ;
       FORALL(domain,ii) {
-        if($cellAdaptMask[ii] == 0 && $totScaledError[ii] > sensitivity)
+        if($scaledErrorSensorCount[ii] > 0 && $cellAdaptMask[ii] == 0 &&
+           $totScaledError[ii] > sensitivity)
           errorList[cnt++] = $totScaledError[ii] ;
       } ENDFORALL ;
 
@@ -298,30 +338,232 @@ namespace Loci {
     }
   } ;
 
-  /// Base cell flag: 1 means refine, -1 means de-refine, and 0 means unchanged.
+  template <class T> struct AMRSourceIDCombine {
+    void operator()(T &res,const T &arg) const
+    {
+      if(arg >= 0 && (res < 0 || arg < res))
+        res = arg ;
+    }
+  } ;
+
+  template <class T> struct AMRSelectedRequestCombine {
+    void operator()(T &res,const T &arg) const
+    {
+      if(arg != 0)
+        res = arg ;
+    }
+  } ;
+
+  //---------------------------------------------------------------------------
+  // Source-based request fusion
+
+  /// Built-in source representing the generic normalized sensor marker.
+  $rule default(amrRequestSource(scaledError)) {
+    $amrRequestSource(scaledError) = true ;
+  }
+
+  /// Selector that keeps the built-in marker attached only to scaledError.
+  $rule default(amrScaledErrorRequestSource(scaledError)) {
+    $amrScaledErrorRequestSource(scaledError) = true ;
+  }
+
+  /// Stable id used by diagnostics for the built-in scaled-error source.
+  $rule default(amrSourceID(scaledError)) {
+    $amrSourceID(scaledError) = 0 ;
+  }
+
+  /// Default priority for the built-in scaled-error source.
+  $rule default(amrSourcePriority(scaledError)) {
+    $amrSourcePriority(scaledError) = 0 ;
+  }
+
+  /// Category label for the built-in scaled-error source.
+  $rule default(amrSourceKind(scaledError)) {
+    $amrSourceKind(scaledError) = "error" ;
+  }
+
+  /// The built-in scaled-error source is a soft request.
+  $rule default(amrSourceHardConstraint(scaledError)) {
+    $amrSourceHardConstraint(scaledError) = false ;
+  }
+
+  /// Convert the normalized sensor value into the built-in AMR request source.
+  $rule pointwise(amrRequest(SRC)<-totScaledError,scaledErrorSensorCount,
+  limitedAdaptSensitivity,coarsenSensitivity),
+  parametric(amrScaledErrorRequestSource(SRC)) {
+    $amrRequest(SRC) = 0 ;
+    if($scaledErrorSensorCount > 0) {
+      if($totScaledError > $limitedAdaptSensitivity) {
+        $amrRequest(SRC) = 1 ;
+      } else if($totScaledError < -$coarsenSensitivity) {
+        $amrRequest(SRC) = -1 ;
+      }
+    }
+  }
+
+  /// Emit a constant request command for a registered debug source. This is
+  /// useful for regression tests of request fusion without solver-specific
+  /// sensor rules.
+  $rule pointwise(amrRequest(SRC)<-amrConstantRequestCommand(SRC)),
+  parametric(amrConstantRequestSource(SRC)) {
+    $amrRequest(SRC) =
+      amrNormalizeRequestCommand($amrConstantRequestCommand(SRC)) ;
+  }
+
+  /// Count source requests for refinement. A solver activates each source by
+  /// creating amrRequestSource(SRC) and providing amrRequest(SRC).
+  $rule unit(amrRefineRequestCount),constraint(geom_cells) {
+    $amrRefineRequestCount = 0 ;
+  }
+
+  $rule apply(amrRefineRequestCount<-amrRequest(SRC))[Loci::Summation],
+  parametric(amrRequestSource(SRC)) {
+    int cnt = ($amrRequest(SRC) > 0)?1:0 ;
+    join($amrRefineRequestCount,cnt) ;
+  }
+
+  /// Count source requests for coarsening.
+  $rule unit(amrCoarsenRequestCount),constraint(geom_cells) {
+    $amrCoarsenRequestCount = 0 ;
+  }
+
+  $rule apply(amrCoarsenRequestCount<-amrRequest(SRC))[Loci::Summation],
+  parametric(amrRequestSource(SRC)) {
+    int cnt = ($amrRequest(SRC) < 0)?1:0 ;
+    join($amrCoarsenRequestCount,cnt) ;
+  }
+
+  /// Priority of the active source chosen by request fusion. Source priority is
+  /// compared before the command, so a high-priority coarsening source can beat
+  /// a lower-priority refinement source.
+  $rule unit(amrWinningPriority),constraint(geom_cells) {
+    $amrWinningPriority = std::numeric_limits<int>::min() ;
+  }
+
+  $rule apply(amrWinningPriority<-amrRequest(SRC),amrSourcePriority(SRC))
+  [Loci::Maximum],
+  parametric(amrRequestSource(SRC)) {
+    int request = amrNormalizeRequestCommand($amrRequest(SRC)) ;
+    int priority = std::numeric_limits<int>::min() ;
+    if(request != 0)
+      priority = $amrSourcePriority(SRC) ;
+    join($amrWinningPriority,priority) ;
+  }
+
+  /// Choose a deterministic diagnostic source id for the fused command. Among
+  /// active sources at the winning priority, the lowest source id wins.
+  $rule unit(amrWinningSource),constraint(geom_cells) {
+    $amrWinningSource = -1 ;
+  }
+
+  $rule apply(amrWinningSource<-amrWinningPriority,amrRequest(SRC),
+  amrSourceID(SRC),amrSourcePriority(SRC))[AMRSourceIDCombine],
+  parametric(amrRequestSource(SRC)) {
+    int request = amrNormalizeRequestCommand($amrRequest(SRC)) ;
+    int source = -1 ;
+    if(request != 0 && $amrSourcePriority(SRC) == $amrWinningPriority)
+      source = $amrSourceID(SRC) ;
+    join($amrWinningSource,source) ;
+  }
+
+  /// Final fused command. Once priority fusion chooses a source, that source's
+  /// command decides whether this cell refines, coarsens, or remains unchanged.
+  $rule unit(amrFusedRequest),constraint(geom_cells) {
+    $amrFusedRequest = 0 ;
+  }
+
+  $rule apply(amrFusedRequest<-amrWinningSource,amrRequest(SRC),
+  amrSourceID(SRC))[AMRSelectedRequestCombine],
+  parametric(amrRequestSource(SRC)) {
+    int request = 0 ;
+    if($amrWinningSource >= 0 && $amrSourceID(SRC) == $amrWinningSource)
+      request = amrNormalizeRequestCommand($amrRequest(SRC)) ;
+    join($amrFusedRequest,request) ;
+  }
+
+  /// Record the command selected by priority-aware request fusion.
+  $rule pointwise(amrWinningCommand<-amrFusedRequest) {
+    $amrWinningCommand = $amrFusedRequest ;
+  }
+
+  /// Count requests that disagreed with the selected command.
+  $rule pointwise(amrConflictCount<-amrFusedRequest,amrRefineRequestCount,
+  amrCoarsenRequestCount) {
+    if($amrFusedRequest > 0) {
+      $amrConflictCount = $amrCoarsenRequestCount ;
+    } else if($amrFusedRequest < 0) {
+      $amrConflictCount = $amrRefineRequestCount ;
+    } else {
+      $amrConflictCount = $amrRefineRequestCount + $amrCoarsenRequestCount ;
+    }
+  }
+
+  //---------------------------------------------------------------------------
+  // Final AMR marker composition
+
+  /// Module-internal marker after request fusion: 1 refines, -1 coarsens, and
+  /// 0 means unchanged. Solver rules should feed amrRequest(SRC), not this fact.
   $rule unit(cellRefFlag),constraint(geom_cells) {
     $cellRefFlag = 0 ;
   }
 
-  /// Convert the normalized sensor value into a signed AMR request. If multiple
-  /// rules contribute to cellRefFlag, refinement takes precedence.
-  $rule apply(cellRefFlag<-totScaledError,limitedAdaptSensitivity,
-  coarsenSensitivity)[AMRFlagCombine] {
-    int flag = 0 ;
-    if($totScaledError > $limitedAdaptSensitivity) {
-      flag = 1 ;
-    }
-    if($totScaledError < -$coarsenSensitivity) {
-      flag = -1 ;
-    }
-    join($cellRefFlag,flag) ;
+  /// Add the source-fused AMR request to the final cell marker.
+  $rule apply(cellRefFlag<-amrFusedRequest)[AMRFlagCombine] {
+    join($cellRefFlag,$amrFusedRequest) ;
   }
 
-  /// Apply geometric protection masks without suppressing de-refinement.
+  /// Apply geometric protection masks without suppressing coarsening requests.
   $rule pointwise(cellRefFlagMask<-cellAdaptMask,cellRefFlag) {
     $cellRefFlagMask = $cellRefFlag ;
     if($cellRefFlag > 0 && $cellAdaptMask != 0)
       $cellRefFlagMask = 0 ;
+  }
+
+  //---------------------------------------------------------------------------
+  // AMR requested-decision history
+
+  /// Default level for cells without carried adapted-continuation state.
+  $rule pointwise(amrCellLevel),constraint(geom_cells,amr_not_restart) {
+    $amrCellLevel = 0 ;
+  }
+
+  /// Signed action requested by fusion after final protection masks.
+  $rule pointwise(amrRequestedAction<-cellRefFlagMask) {
+    $amrRequestedAction = $cellRefFlagMask ;
+  }
+
+  /// Source id associated with the requested action, or -1 when no action is
+  /// requested for the cell.
+  $rule pointwise(amrRequestedWinningSource<-cellRefFlagMask,
+  amrWinningSource) {
+    $amrRequestedWinningSource = -1 ;
+    if($cellRefFlagMask != 0)
+      $amrRequestedWinningSource = $amrWinningSource ;
+  }
+
+  /// Adaptation step associated with the requested action. refineLevel is the
+  /// scheduler-visible AMR cycle identifier available to this module.
+  $rule pointwise(amrRequestedAdaptStep<-cellRefFlagMask,refineLevel) {
+    $amrRequestedAdaptStep = -1 ;
+    if($cellRefFlagMask != 0)
+      $amrRequestedAdaptStep = $refineLevel ;
+  }
+
+  /// Compatibility aliases for ordinary marking queries. Adapted-continuation
+  /// rules replace these with accepted topology actions after remeshing.
+  $rule pointwise(amrLastAction<-amrRequestedAction),
+  constraint(amr_not_restart) {
+    $amrLastAction = $amrRequestedAction ;
+  }
+
+  $rule pointwise(amrLastWinningSource<-amrRequestedWinningSource),
+  constraint(amr_not_restart) {
+    $amrLastWinningSource = $amrRequestedWinningSource ;
+  }
+
+  $rule pointwise(amrLastAdaptStep<-amrRequestedAdaptStep),
+  constraint(amr_not_restart) {
+    $amrLastAdaptStep = $amrRequestedAdaptStep ;
   }
 
   /// Count positive refinement requests after masking.
@@ -334,7 +576,8 @@ namespace Loci {
     join($refCount,cnt) ;
   }
 
-  /// Count de-refinement requests after masking.
+  /// Count coarsening requests after masking. The fact name follows FVMAdapt's
+  /// de-refine terminology.
   $rule unit(derefCount),constraint(UNIVERSE) {
     $derefCount = 0 ;
   }
@@ -683,4 +926,41 @@ namespace Loci {
     join($cl->$cell_error_vM(VM,WM,N),val) ;
     join($cr->$cell_error_vM(VM,WM,N),val) ;
   }
+
+  //---------------------------------------------------------------------------
+  // Structured face-jump sensor metrics
+
+  $type XS store<real> ;
+
+  /// Module-generated scalar face-jump metric for a selected solver field.
+  /// The result is an ordinary scalar sensor store consumed by adaptSensor().
+  $rule pointwise(amrScalarFaceJump(XS)<-
+    cell_error_s(leftsP(XS,Zero),rightsP(XS,Zero))),
+  parametric(amrUseScalarFaceJump(XS)),
+  inplace(amrScalarFaceJump(XS)|cell_error_s(leftsP(XS,Zero),rightsP(XS,Zero))),
+  prelude {
+  } ;
+
+  $type XV store<vect3d> ;
+
+  /// Module-generated 3D-vector face-jump metric for a selected solver field.
+  /// The vector jump magnitude is reduced to a scalar sensor store.
+  $rule pointwise(amrVectorFaceJump(XV)<-
+    cell_error_v3d(leftv3d(XV),rightv3d(XV))),
+  parametric(amrUseVectorFaceJump(XV)),
+  inplace(amrVectorFaceJump(XV)|cell_error_v3d(leftv3d(XV),rightv3d(XV))),
+  prelude {
+  } ;
+
+  $type XVM storeVec<real> ;
+
+  /// Module-generated variable-length-vector face-jump metric for a selected
+  /// solver field. The component jump norm is reduced to a scalar sensor store.
+  $rule pointwise(amrMVectorFaceJump(XVM)<-
+    cell_error_vM(leftvM(XVM),rightvM(XVM),vecSize(leftvM(XVM)))),
+  parametric(amrUseMVectorFaceJump(XVM)),
+  inplace(amrMVectorFaceJump(XVM)|
+    cell_error_vM(leftvM(XVM),rightvM(XVM),vecSize(leftvM(XVM)))),
+  prelude {
+  } ;
 }

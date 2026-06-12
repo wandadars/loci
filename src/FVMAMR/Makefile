@@ -20,7 +20,7 @@
 ###############################################################################
 LOCI_BASE ?= /usr/tmp/lush/Loci
 
-OBJS = adaption.o transfer.o restart.o
+OBJS = adaption.o distance.o transfer.o restart.o
 MODULE_NAME = fvmamr
 
 include $(LOCI_BASE)/Loci.conf

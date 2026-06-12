@@ -19,10 +19,12 @@
 //#
 //#############################################################################
 
-// Vars-file variables for mesh adaptation.
+//---------------------------------------------------------------------------
+// Vars-file adaptation controls
+//---------------------------------------------------------------------------
 
 /// Controls adaptation mode. Valid values are "isotropic", "anisotropic", and
-/// "2D".
+/// "2D"; any other value currently falls back to anisotropic FVMAdapt behavior.
 $type adaptMode param<std::string> ;
 
 /// Minimum edge length allowed for refinement.
@@ -31,35 +33,62 @@ $type adaptMinEdgeLength param<double> ;
 /// Face folding criterion used by the FVMAdapt remesher.
 $type adaptFaceFold param<double> ;
 
-/// FVMAdapt balancing method used to balance refinement levels.
+/// Reserved FVMAdapt balancing method. Declared for compatibility with older
+/// controls; the current setup helper does not pass this value to FVMAdapt.
 $type adaptBalanceType param<int> ;
 
-/// Solver-provided cadence option for adaptation checks.
+/// Solver-owned cadence option for adaptation checks. FVMAMR declares the fact;
+/// the solver decides how it participates in the timestep loop.
 $type adaptFrequency param<int> ;
 
-/// Solver-provided first cycle at which adaptation may start.
+/// Solver-owned first cycle at which adaptation may start.
 $type adaptStart param<int> ;
 
 /// Error threshold for refinement.
 $type adaptSensitivity param<double> ;
 
-/// Error threshold for de-refinement.
+/// Error threshold for coarsening requests from the built-in scaled-error source.
 $type coarsenSensitivity param<double> ;
 
-/// Maximum number of adaptation steps to perform.
+/// Solver-owned maximum number of adaptation steps to perform.
 $type maxAdaptSteps param<int> ;
 
 /// Maximum cell count during adaptation, in millions of cells. A negative
 /// value disables this limit.
 $type maxAdaptCellCount param<double> ;
 
-/// Comma-separated list of sensor names to use for adaptation.
+/// Comma-separated list of scalar metric store names to use for adaptation. A
+/// selected name must identify a solver-provided or module-generated cell store.
 $type adaptSensor param<std::string> ;
 
-/// Per-sensor switch created from adaptSensor by application startup code.
+/// Per-sensor switch created from adaptSensor by setup code. X names the metric
+/// store that the normalization rules read.
 $type adaptSensor(X) param<bool> ;
 
-// Shared adaptation hooks and constraints.
+/// Structured metric selectors used to build common AMR sensors from solver
+/// fields. Each option name is a solver field; setup expands it into generated
+/// metric stores such as amrScalarFaceJump(X), then selects those stores.
+$type adaptSensorMetrics param<Loci::options_list> ;
+
+/// Debug and regression-test request sources. Each option name is a source and
+/// each value provides a constant command plus source metadata.
+$type amrConstantRequestSources param<Loci::options_list> ;
+
+/// Distance request sources built from mesh boundaries. Each option name is a
+/// source and each value provides the boundary name, source metadata, and
+/// distance thresholds.
+$type amrBoundaryDistanceSources param<Loci::options_list> ;
+
+/// Backward-compatible alias for amrBoundaryDistanceSources.
+$type amrNamedBoundaryDistanceSources param<Loci::options_list> ;
+
+/// Per-sensor scale factor applied before selected metrics are combined into
+/// totScaledError. A value of 1.0 preserves the legacy adaptSensor behavior.
+$type adaptSensorWeight(X) param<double> ;
+
+//---------------------------------------------------------------------------
+// Shared solver hooks and FVMAdapt staging facts
+//---------------------------------------------------------------------------
 
 /// Solver-owned flag indicating that this query should stage AMR data.
 $type do_adapt param<bool> ;
@@ -68,16 +97,20 @@ $type do_adapt param<bool> ;
 $type adaptMode2D Constraint ;
 $type adaptMode3D Constraint ;
 
-/// Current adapted mesh level. Solvers that run in-memory AMR should maintain
-/// this fact between remesh cycles.
+/// Legacy name for the adaptation-cycle id maintained by the solver driver.
+/// This records when a request was made; per-cell refinement depth is tracked
+/// by amrCellLevel.
 $type refineLevel param<int> ;
 
-/// Driver-provided flag for adapted continuation. A positive value activates
-/// parent-to-child interpolation from data staged before remeshing.
+/// Legacy name for the after-remesh continuation flag. A positive value
+/// activates parent-to-child interpolation from data staged before remeshing.
 $type refineRestart param<int> ;
 
 /// Constraint present during adapted continuation/restart interpolation.
 $type amr_restart Constraint ;
+
+/// Constraint present during ordinary AMR marking queries.
+$type amr_not_restart Constraint ;
 
 /// Parent-cell partition weighting hints for post-AMR repartitioning. The module
 /// supplies uniform weights unless the solver provides a more specific rule.
@@ -92,10 +125,205 @@ $type amrTagCount param<int> ;
 /// Constraint that is present only when at least one AMR tag requests change.
 $type adaptTagsActive Constraint ;
 
-// Generic tagging and sensor variables.
+//---------------------------------------------------------------------------
+// AMR request-fusion metadata and policy
+//---------------------------------------------------------------------------
 
-/// Optional per-sensor integer marker hook. Solvers may use this for their own
-/// tagging diagnostics or compose it into cellRefFlag with additional rules.
+/// C++ helper for custom request-fusion policies. The stock .loci schedule does
+/// not consult this object; it uses amrSourcePriority(SRC), then the lowest
+/// amrSourceID(SRC), then the selected source's command.
+$type amrRequestArbiter blackbox<Loci::AMRRequestArbiter> ;
+
+/// Selector for constant request sources used by debug and regression cases.
+$type amrConstantRequestSource(SRC) param<bool> ;
+
+/// Constant signed command emitted by amrConstantRequestSource(SRC).
+$type amrConstantRequestCommand(SRC) param<int> ;
+
+/// Selector for the built-in scaled-error request source.
+$type amrScaledErrorRequestSource(SRC) param<bool> ;
+
+/// Per-source switch used to instantiate request-fusion rules. SRC is a
+/// schedule-time source label, not a cell store read by the rule. A manually
+/// registered source also needs amrSourceID(SRC), amrSourcePriority(SRC), and
+/// a rule that writes the runtime command amrRequest(SRC).
+$type amrRequestSource(SRC) param<bool> ;
+
+/// Stable integer id for a registered request source. This is source metadata,
+/// not a mesh entity id. IDs must be unique across active sources because the
+/// selected command is recovered by matching this id; lower ids break
+/// equal-priority ties.
+$type amrSourceID(SRC) param<int> ;
+
+/// Default source priority used by policy-driven fusion rules.
+$type amrSourcePriority(SRC) param<int> ;
+
+/// Source category, such as error, geometry, region, or solver-field. This is
+/// metadata for diagnostics and future policies.
+$type amrSourceKind(SRC) param<std::string> ;
+
+/// Hard/soft source classification metadata. The stock .loci priority policy
+/// records this value for diagnostics and future policies, but does not give it
+/// special priority.
+$type amrSourceHardConstraint(SRC) param<bool> ;
+
+//---------------------------------------------------------------------------
+// Distance request helpers
+//---------------------------------------------------------------------------
+
+/// Selector for distance-threshold request sources. The solver provides
+/// amrDistanceToTarget(SRC); FVMAMR converts that distance to amrRequest(SRC).
+$type amrDistanceRequestSource(SRC) param<bool> ;
+
+/// Selector for module-built distances to a mesh boundary. Startup code creates
+/// amrBoundaryFaces(SRC) and amrClosestBoundaryFace(SRC); FVMAMR maps through
+/// the closest face to compute amrDistanceToTarget(SRC).
+$type amrBoundaryDistanceSource(SRC) param<bool> ;
+
+/// Compatibility selector name for older branch-local experiments. It is
+/// bridged to amrBoundaryDistanceSource(SRC); new solver code should use the
+/// canonical selector instead.
+$type amrNamedBoundaryDistanceSource(SRC) param<bool> ;
+
+/// Boundary faces selected by a boundary-distance source.
+$type amrBoundaryFaces(SRC) Constraint ;
+
+/// Optional human-readable target name, such as a boundary, interface, or body.
+$type amrDistanceTargetName(SRC) param<std::string> ;
+
+/// Refine when amrDistanceToTarget(SRC) is below this value. A negative value
+/// disables this threshold.
+$type amrDistanceRefineLessThan(SRC) param<double> ;
+
+/// Refine when amrDistanceToTarget(SRC) is above this value. A negative value
+/// disables this threshold.
+$type amrDistanceRefineGreaterThan(SRC) param<double> ;
+
+/// Coarsen when amrDistanceToTarget(SRC) is below this value. A negative value
+/// disables this threshold.
+$type amrDistanceCoarsenLessThan(SRC) param<double> ;
+
+/// Coarsen when amrDistanceToTarget(SRC) is above this value. A negative value
+/// disables this threshold.
+$type amrDistanceCoarsenGreaterThan(SRC) param<double> ;
+
+//---------------------------------------------------------------------------
+// Source-specific AMR requests
+//---------------------------------------------------------------------------
+
+/// Source-specific signed request store: 1 refines, -1 coarsens, and 0 leaves
+/// unchanged. Dynamic source behavior should be expressed here; adding a new
+/// SRC label requires fact setup before the AMR query schedule is built.
+$type amrRequest(SRC) store<int> ;
+
+/// Optional normalized strength for richer policies and diagnostics. The stock
+/// .loci priority policy ignores this fact.
+$type amrRequestStrength(SRC) store<Loci::real_t> ;
+
+/// Source-specific distance to a target object. The target may be a named
+/// boundary, region, immersed body, interface, or another solver-defined object.
+$type amrDistanceToTarget(SRC) store<Loci::real_t> ;
+
+/// Cell-to-nearest-boundary-face map created by boundary-distance helpers.
+$type amrClosestBoundaryFace(SRC) Map ;
+
+/// Optional desired refinement level for richer policies. The stock .loci
+/// priority policy ignores this fact; a negative value means unset.
+$type amrRequestTargetLevel(SRC) store<int> ;
+
+/// Optional desired cell size for richer policies. The stock .loci priority
+/// policy ignores this fact; a negative value means unset.
+$type amrRequestTargetSize(SRC) store<Loci::real_t> ;
+
+//---------------------------------------------------------------------------
+// AMR fusion results and diagnostics
+//---------------------------------------------------------------------------
+
+/// Final signed request chosen by request fusion before FVMAdapt tag encoding.
+$type amrFusedRequest store<int> ;
+
+/// Priority of the source selected by request fusion. The value is meaningful
+/// only when amrWinningSource is nonnegative.
+$type amrWinningPriority store<int> ;
+
+/// Source id reported for the fused command, or -1 when no source requested
+/// adaptation. Priority fusion reports the lowest id among active sources at
+/// the winning priority.
+$type amrWinningSource store<int> ;
+
+/// Diagnostic alias for amrFusedRequest, kept as an explicit "winner command"
+/// output for schedules and visualization.
+$type amrWinningCommand store<int> ;
+
+/// Number of active requests that disagreed with the winning command.
+$type amrConflictCount store<int> ;
+
+/// Number of sources requesting refinement for each cell.
+$type amrRefineRequestCount store<int> ;
+
+/// Number of sources requesting coarsening for each cell.
+$type amrCoarsenRequestCount store<int> ;
+
+//---------------------------------------------------------------------------
+// AMR cell lineage and last-action history
+//---------------------------------------------------------------------------
+
+/// Opaque view of the dynamic FVMAdapt parent-child relation and accepted
+/// categorical history derived from the staged parent facts.
+$type AMRLineageMap blackbox<Loci::AMRLineageMap> ;
+
+/// Signed action requested by the fusion layer after final protection masks.
+$type amrRequestedAction store<int> ;
+
+/// Source id associated with the requested action, or -1 for no action.
+$type amrRequestedWinningSource store<int> ;
+
+/// Adaptation step associated with the requested action.
+$type amrRequestedAdaptStep store<int> ;
+
+/// Raw topological action observed from FVMAdapt lineage after remeshing.
+$type amrTopologyAction store<int> ;
+
+/// Nonzero when the current cell appears in the AMR lineage map.
+$type amrLineageMapped store<int> ;
+
+/// Number of previous-mesh parent cells mapped to this current cell.
+$type amrLineageParentCount store<int> ;
+
+/// Number of current-mesh children produced by this cell's previous parent.
+$type amrLineageChildCount store<int> ;
+
+/// Accepted AMR action exposed to solvers after remeshing. It currently mirrors
+/// amrTopologyAction and is paired with accepted source/step history.
+$type amrAcceptedAction store<int> ;
+
+/// Source id associated with the accepted topology action. This is copied from
+/// a parent request only when the actual topology action matches that request.
+$type amrAcceptedWinningSource store<int> ;
+
+/// Adaptation step associated with the accepted topology action.
+$type amrAcceptedAdaptStep store<int> ;
+
+/// Per-cell refinement depth tracked through the accepted AMR lineage.
+$type amrCellLevel store<int> ;
+
+/// Last signed AMR action. On ordinary marking queries this is the requested
+/// action; on adapted-continuation queries this is the accepted topology action.
+$type amrLastAction store<int> ;
+
+/// Source id associated with amrLastAction.
+$type amrLastWinningSource store<int> ;
+
+/// Adaptation step associated with amrLastAction.
+$type amrLastAdaptStep store<int> ;
+
+//---------------------------------------------------------------------------
+// Generic tagging and sensor variables
+//---------------------------------------------------------------------------
+
+/// Deprecated legacy per-sensor integer marker hook. There is no active bridge
+/// from refineCell(X) into the request-fusion path; new solver interfaces should
+/// write amrRequest(SRC).
 $type refineCell(X) store<int> ;
 
 /// Largest local edge-length estimate used to protect already-small cells.
@@ -114,36 +342,70 @@ $type cellMean(X) param<double> ;
 /// Global sample variance of a solver-provided scalar sensor field.
 $type cellSigmaSq(X) param<double> ;
 
+/// Number of selected sensor metrics contributing to each cell.
+$type scaledErrorSensorCount store<int> ;
+
+/// Raw maximum normalized selected sensor value before no-sensor guarding.
+$type maxScaledError store<Loci::real_t> ;
+
 /// Combined normalized sensor value used by the default threshold marker.
 $type totScaledError store<Loci::real_t> ;
 
 /// Effective refinement threshold after applying the maximum-cell-count cap.
 $type limitedAdaptSensitivity blackbox<double> ;
 
-/// Signed local AMR request: 1 refines, -1 de-refines, and 0 leaves unchanged.
+/// Module-internal signed AMR request after source fusion: 1 refines, -1
+/// coarsens, and 0 leaves unchanged. Solvers should write amrRequest(SRC)
+/// instead of this fact.
 $type cellRefFlag store<int> ;
 
-/// Signed AMR request after applying geometric protection masks.
+/// Module-internal signed AMR request after applying geometric protection masks.
 $type cellRefFlagMask store<int> ;
 
 /// Number of cells requesting refinement.
 $type refCount param<int> ;
 
-/// Number of cells requesting de-refinement.
+/// Number of cells requesting coarsening. The fact name follows FVMAdapt's
+/// de-refine terminology.
 $type derefCount param<int> ;
 
-/// Parametric scalar face-difference error kernel.
+/// Internal scalar face-difference kernel used to build amrScalarFaceJump(X).
 $type cell_error_s(X,Y) store<Loci::real_t> ;
 
-/// Parametric vector face-difference error kernel.
+/// Internal vector face-difference kernel used to build amrVectorFaceJump(V).
 $type cell_error_v3d(V,W) store<Loci::real_t> ;
 
-/// Parametric variable-length vector face-difference error kernel.
+/// Internal variable-length vector face-difference kernel used to build
+/// amrMVectorFaceJump(VM).
 $type cell_error_vM(VM,WM,N) store<Loci::real_t> ;
 
-// Generic extrema helpers used by clipping and future region logic. Nodal
-// extrema are scatter targets; cell extrema collect values over the surrounding
-// face nodes.
+//---------------------------------------------------------------------------
+// Structured sensor metric kernels
+//---------------------------------------------------------------------------
+
+/// Selector for scalar face-jump metrics created from adaptSensorMetrics.
+$type amrUseScalarFaceJump(X) param<bool> ;
+
+/// Selector for 3D-vector face-jump metrics created from adaptSensorMetrics.
+$type amrUseVectorFaceJump(X) param<bool> ;
+
+/// Selector for variable-length-vector face-jump metrics from adaptSensorMetrics.
+$type amrUseMVectorFaceJump(X) param<bool> ;
+
+/// Scalar sensor metric generated from a scalar solver field.
+$type amrScalarFaceJump(X) store<Loci::real_t> ;
+
+/// Scalar sensor metric generated from a 3D-vector solver field.
+$type amrVectorFaceJump(X) store<Loci::real_t> ;
+
+/// Scalar sensor metric generated from a variable-length-vector solver field.
+$type amrMVectorFaceJump(X) store<Loci::real_t> ;
+
+//---------------------------------------------------------------------------
+// Generic extrema helpers for clipping and future region logic
+//---------------------------------------------------------------------------
+// Nodal extrema are scatter targets; cell extrema collect values over the
+// surrounding face nodes.
 
 $type nodalScalarMax(X) store<Loci::real_t> ;
 $type nodalScalarMin(X) store<Loci::real_t> ;

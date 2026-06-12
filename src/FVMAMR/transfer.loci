@@ -32,13 +32,16 @@ namespace Loci {
   using std::min ;
   using std::vector ;
 
-  /// Stage the FVM geometric stencil used by AMRInterpolationMapping. Neighbor
-  /// entries are written with file-order cell numbers, while the stores
-  /// themselves are redistributed into the same file-order partitioning.
+  /// Stage the FVM geometric stencil and requested AMR decision history used
+  /// after remeshing. Neighbor entries are written with file-order cell numbers,
+  /// and the staged action/source/step/level stores use the same file-order
+  /// partitioning so accepted lineage can be reconstructed on the adapted grid.
   $rule pointwise(OUTPUT<-(upper,lower,boundary_map)->facecenter,
                   lower->cl->fileNumber(geom_cells),
                   upper->cr->fileNumber(geom_cells),
-                  cellcenter,vol),
+                  cellcenter,vol,amrRequestedAction,
+                  amrRequestedWinningSource,amrRequestedAdaptStep,
+                  amrCellLevel),
     constraint(geom_cells),conditional(do_adapt),
     option(disable_threading),prelude {
     entitySet dom = entitySet(seq) ;
@@ -99,5 +102,32 @@ namespace Loci {
     } ENDFORALL ;
     replaceAMRDBItem(AMR_DB_VOL,
                      redistributeAMRStoreToFileOrder(volw.Rep(),dom,dist)) ;
+
+    store<int> requestedAction ;
+    requestedAction.allocate(dom) ;
+    store<int> requestedSource ;
+    requestedSource.allocate(dom) ;
+    store<int> requestedStep ;
+    requestedStep.allocate(dom) ;
+    store<int> cellLevel ;
+    cellLevel.allocate(dom) ;
+    FORALL(dom,ii) {
+      requestedAction[ii] = $amrRequestedAction[ii] ;
+      requestedSource[ii] = $amrRequestedWinningSource[ii] ;
+      requestedStep[ii] = $amrRequestedAdaptStep[ii] ;
+      cellLevel[ii] = $amrCellLevel[ii] ;
+    } ENDFORALL ;
+    replaceAMRDBItem(AMR_DB_REQUESTED_ACTION,
+                     redistributeAMRStoreToFileOrder(requestedAction.Rep(),
+                                                     dom,dist)) ;
+    replaceAMRDBItem(AMR_DB_REQUESTED_WINNING_SOURCE,
+                     redistributeAMRStoreToFileOrder(requestedSource.Rep(),
+                                                     dom,dist)) ;
+    replaceAMRDBItem(AMR_DB_REQUESTED_ADAPT_STEP,
+                     redistributeAMRStoreToFileOrder(requestedStep.Rep(),
+                                                     dom,dist)) ;
+    replaceAMRDBItem(AMR_DB_CELL_LEVEL,
+                     redistributeAMRStoreToFileOrder(cellLevel.Rep(),
+                                                     dom,dist)) ;
   } ;
 }
