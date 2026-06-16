@@ -53,67 +53,27 @@ namespace Loci {
   class fact_db ;
   class sched_db ;
 
-  /// @brief Abstract interface for the runtime join operation used by
-  ///   reduction-style `apply_rule`s.
-  ///
-  /// When a variable is computed through a unit/apply reduction pattern, the
-  /// contributing `apply_rule` provides a `joiner` that knows how to merge a
-  /// source value into the target store representation. Execution code uses
-  /// this interface to clone the operation, allocate a compatible target
-  /// representation, bind source and target stores, and perform the join over
-  /// a sequence of entities, optionally through a map from target entities to
-  /// source entities.
+  /// @brief Interface for merging source values into a target representation.
   class joiner : public CPTR_type {
   public:
-    /// @brief Creates an unbound copy of this join operation.
-    ///
-    /// The clone preserves the concrete join behavior, but callers are
-    /// expected to bind it to specific source and target store
-    /// representations with `SetArgs()` before calling `Join()`.
-    ///
-    /// @return A fresh `joiner` of the same concrete type.
+    /// @brief Returns a fresh unbound joiner of the same concrete type.
     virtual CPTR<joiner> clone() = 0 ;
 
-    /// @brief Returns a prototype store representation for the join target.
-    ///
-    /// Callers use this to obtain a store representation compatible with the
-    /// reduction target, either to inspect its kind or to allocate and unpack
-    /// temporary values before binding the joiner. The returned representation
-    /// is not yet bound to live rule data.
-    ///
-    /// @return A target-compatible `storeRepP`, or `0` when the joiner does
-    ///   not expose a concrete target representation.
+    /// @brief Returns a prototype store representation, or `0` if unsupported.
     virtual storeRepP getTargetRep() = 0 ;
 
-    /// @brief Binds the joiner to the target and source store representations
-    ///   used by the next join.
-    ///
-    /// The first argument is the store that will be updated, and the second is
-    /// the store whose values will be merged into it.
-    ///
-    /// @param[in] target Store representation that receives the joined values.
-    /// @param[in] source Store representation that provides the incoming
-    ///   values.
+    /// @brief Binds target and source store representations for `Join()`.
+    /// @param[in,out] target Store representation updated by `Join()`.
+    /// @param[in] source Store representation read by `Join()`.
     virtual void SetArgs(storeRepP &target, storeRepP &source) = 0 ;
 
-    /// @brief Applies the join over entities that use the same indexing in the
-    ///   source and target stores.
-    ///
-    /// After `SetArgs()`, this joins the source value into the target value
-    /// for each entity named in `seq`.
-    ///
-    /// @param[in] seq Entity sequence to join.
+    /// @brief Applies the join without source remapping.
+    /// @param[in] seq Entity sequence for indexed stores.
     virtual void Join(const sequence &seq) = 0 ;
 
-    /// @brief Applies the join over entities whose source and target indices
-    ///   are related by a map.
-    ///
-    /// After `SetArgs()`, this joins each target entity in `seq` with the
-    /// source entity selected by `t2s`. For joiners whose concrete storage
-    /// does not require per-entity remapping, the map may be ignored.
-    ///
-    /// @param[in] t2s Map from target entities to source entities.
-    /// @param[in] seq Target-side entity sequence to join.
+    /// @brief Applies the join with target-to-source remapping.
+    /// @param[in] t2s Source lookup map for indexed stores.
+    /// @param[in] seq Target entity sequence for indexed stores.
     virtual void Join(Map &t2s, const sequence &seq) = 0 ;
   } ;
 
@@ -182,9 +142,10 @@ namespace Loci {
       use_parametric_variable = true ;
       ParametricVariable = variable(name) ;
     }
-    // these should be called if the pre- and postlude methods are present
-    void enable_prelude() { use_prelude = true; }
-    void enable_postlude() { use_postlude = true; }
+    // Should be called if the prelude methods are present
+    void enable_prelude() { use_prelude = true ; }
+    // Should be called if the postlude methods are present
+    void enable_postlude() { use_postlude = true ; }
     void name_store(const std::string &name,store_instance &si) ;
     void input(const std::string &invar) { source(invar) ; }
     void output(const std::string &outvar) { target(outvar) ; }
@@ -304,8 +265,8 @@ namespace Loci {
     virtual void postlude(const sequence&) {}
     virtual CPTR<joiner> get_joiner() = 0 ;
     virtual rule_implP add_namespace(const std::string& n) const ;
-    std::string get_comments() const {return rule_comments ;}
-    std::string get_fileloc() const { return fileloc; }
+    std::string get_comments() const {return rule_comments ; }
+    std::string get_fileloc() const { return fileloc ; }
   } ;
 
   typedef rule_impl::rule_implP rule_implP ;
@@ -323,7 +284,7 @@ namespace Loci {
   template <class TCopyRuleImpl> rule_implP copy_rule_impl<TCopyRuleImpl>::new_rule_impl() const {
     rule_implP realrule_impl = new copy_rule_impl<TCopyRuleImpl> ;
     for(list_iter li = rvlist.begin(); li != rvlist.end(); ++li) {
-      std::map<variable, variable> rvm = *li;
+      std::map<variable, variable> rvm = *li ;
       realrule_impl->rename_vars(rvm) ;
     }
     return realrule_impl ;
@@ -337,7 +298,7 @@ namespace Loci {
 
 
   /// This is the new rule type for setting default values in the facts
-  /// database. It should not have any inputs
+  /// database. It should not have any inputs.
   class default_rule: public rule_impl {
   protected:
     default_rule() { rule_class(DEFAULT) ; }
@@ -361,7 +322,7 @@ namespace Loci {
   } ;
 
   /// This is the rule type for setting optional values in the facts database.
-  /// It should not have any inputs
+  /// It should not have any inputs.
   class optional_rule: public rule_impl {
   protected:
     optional_rule() { rule_class(OPTIONAL) ; }
@@ -384,11 +345,7 @@ namespace Loci {
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   } ;
 
-  /// Rule type for computing `Constraint`-typed outputs at runtime.
-  ///
-  /// A `constraint_rule` is used to derive constraint facts from existing
-  /// inputs during execution. The resulting constraints may then be consumed
-  /// by later Loci rules.
+  /// Rule type for rules that output constraints.
   class constraint_rule: public rule_impl {
   protected:
     constraint_rule() { rule_class(CONSTRAINT_RULE) ; }
@@ -454,11 +411,10 @@ namespace Loci {
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   } ;
 
-  /// Internal base class for special system rules whose scheduler behavior is
-  /// defined through custom existential and request-processing hooks.
+  /// Base class for `SUPER_RULE` implementations.
   class super_rule : public rule_impl {
   protected:
-    super_rule() { rule_class(SUPER_RULE) ; disable_threading(); }
+    super_rule() { rule_class(SUPER_RULE) ; disable_threading() ; }
     void name_store(const std::string &nm, store_instance &si) {
       rule_impl::name_store(nm,si) ;
     }
@@ -522,10 +478,7 @@ namespace Loci {
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   } ;
 
-  /// Base class for the initializing rule in a unit/apply reduction.
-  ///
-  /// A `unit_rule` seeds the reduction target with its unit value before the
-  /// corresponding `apply_rule` accumulates contributions into it.
+  /// Base class for `UNIT` reduction rules.
   class unit_rule : public rule_impl {
    protected:
     unit_rule() { rule_class(UNIT) ; }
@@ -547,58 +500,30 @@ namespace Loci {
     virtual CPTR<joiner> get_joiner() { return CPTR<joiner>(0) ; }
   } ;
 
-  /// Adapts a reduction operator `Op` to the runtime `joiner` interface.
-  ///
-  /// `apply_rule<T,Op>` uses this adapter so the same combine operation can be
-  /// reused when Loci merges partial results across threads, processors, or
-  /// mapped local-reduction targets.
+  /// Default `joiner` adapter for entity-indexed store types.
   template <class T, class Op> class joinOp : public joiner {
-    /// Reduction operator used to merge source values into target values.
     Op join ;
-
-    /// Typed views bound to the target and source store representations for
-    /// the next join.
     T t,s ;
   public:
-    /// @brief Creates an unbound copy of this typed join adapter.
     virtual CPTR<joiner> clone() {
       return CPTR<joiner>(new joinOp<T,Op> ) ;
     }
 
-    /// @brief Returns a prototype store representation for the reduction
-    ///   target type `T`.
     virtual storeRepP getTargetRep() {
       T st ;
       return st.Rep() ;
     }
 
-    /// @brief Binds this adapter to the concrete target and source stores used
-    ///   by the next join.
-    ///
-    /// @param[in] target Store representation that will be updated.
-    /// @param[in] source Store representation that provides incoming values.
     virtual void SetArgs(storeRepP &target, storeRepP &source) {
       s.setRep(source) ; t.setRep(target) ;
     }
 
-    /// @brief Applies `Op` to matching source and target entities.
-    ///
-    /// For each entity in `seq`, this combines `source[i]` into `target[i]`.
-    ///
-    /// @param[in] seq Entity sequence whose source and target indices match.
     virtual void Join(const sequence &seq) {
       for(sequence::const_iterator i=seq.begin();i!=seq.end();++i) {
         join(t[*i],s[*i]) ;
       }
     }
 
-    /// @brief Applies `Op` when the source entity is selected through a map.
-    ///
-    /// For each target entity `i` in `seq`, this combines `source[t2s[i]]`
-    /// into `target[i]`.
-    ///
-    /// @param[in] t2s Map from target entities to source entities.
-    /// @param[in] seq Target-side entity sequence to join.
     virtual void Join(Map &t2s, const sequence &seq)  {
       for(sequence::const_iterator i=seq.begin();i!=seq.end();++i) {
         join(t[*i],s[t2s[*i]]) ;
@@ -607,11 +532,7 @@ namespace Loci {
   } ;
 
 
-  /// Sentinel specialization for blackbox targets.
-  ///
-  /// The generic reduction runtime does not provide a blackbox join adapter, so
-  /// this specialization exists only to satisfy the interface and diagnose
-  /// unexpected use.
+  /// `joinOp` specialization for unsupported blackbox targets.
   template<class Type, class Op> class joinOp<blackbox<Type>,Op> : public joiner {
     Op join ;
   public:
@@ -637,9 +558,6 @@ namespace Loci {
   } ;
 
   /// `joinOp` specialization for parameter targets.
-  ///
-  /// Parameter reductions are global reductions, so the join combines a single
-  /// source value into a single target value and ignores any entity map.
   template<class Type,class Op> class joinOp<param<Type>,Op> : public joiner {
     Op join ;
     param<Type> s,t ;
@@ -665,14 +583,7 @@ namespace Loci {
     }
   } ;
 
-  /// @brief `joinOp` specialization for stores whose per-entity values are
-  ///   vectors.
-  ///
-  /// This adapter binds `storeVec` source and target stores and applies the
-  /// reduction operator `Op` to each target entity in the join sequence. Each
-  /// join combines one source vector into the corresponding target vector,
-  /// either directly by matching entity indices or through a target-to-source
-  /// map.
+  /// `joinOp` specialization for `storeVec` targets.
   template<class Type,class Op> class joinOp<storeVec<Type>,Op> : public joiner {
     Op join ;
     storeVec<Type> s,t ;
@@ -704,13 +615,7 @@ namespace Loci {
     }
   } ;
 
-  /// @brief `joinOp` specialization for matrix-valued `storeMat` targets.
-  ///
-  /// This adapter binds `storeMat<Type>` source and target stores and, for
-  /// each entity in the join sequence, passes the corresponding `Mat<Type>`
-  /// views to `Op` for combination. The mapped overload only changes which
-  /// source entity is selected through `t2s`; it does not add any
-  /// matrix-specific remapping logic.
+  /// `joinOp` specialization for matrix-valued `storeMat` targets.
   template<class Type,class Op> class joinOp<storeMat<Type>,Op> : public joiner {
     /// Reduction operator applied to each matrix-valued contribution.
     Op join ;
@@ -745,19 +650,11 @@ namespace Loci {
     }
   } ;
 
-  /// @brief `joinOp` specialization for `multiStore` targets.
-  ///
-  /// A `multiStore<Type>` holds a variable-length `Vect<Type>` for each entity.
-  /// This adapter binds source and target `multiStore`s and applies `Op` to the
-  /// per-entity vectors selected by the join sequence. The mapped overload uses
-  /// `t2s` only to choose the source entity; it does not change the contents or
-  /// shape of each per-entity vector.
+  /// `joinOp` specialization for `multiStore` targets.
   template<class Type, class Op> class joinOp<multiStore<Type>,Op> :
   public joiner {
-    /// Reduction operator applied to each per-entity vector.
     Op join ;
 
-    /// Bound source and target multiStores used by the next join.
     multiStore<Type> s,t ;
   public:
     virtual CPTR<joiner> clone() {
@@ -787,15 +684,7 @@ namespace Loci {
     }
   } ;
 
-  /// Base class for reduction rules that accumulate contributions with `Op`.
-  ///
-  /// User code calls the protected `join(...)` helper inside the rule body to
-  /// combine one contribution into the target. `get_joiner()` exposes the same
-  /// operation to the runtime so partial results can be merged after threaded or
-  /// distributed execution.
-  ///
-  /// @tparam T Target store type reduced by the rule.
-  /// @tparam Op Reduction operator used to combine contributions.
+  /// Base class for `APPLY` reduction rules.
   template <class T, class Op > class apply_rule : public rule_impl {
   protected:
     apply_rule() { rule_class(APPLY) ; }
@@ -837,19 +726,10 @@ namespace Loci {
 
   } ;
 
-  /// @brief Common reduction operators used as the `Op` argument to
-  ///   `apply_rule`.
-  ///
-  /// `apply_rule` uses these function objects both in user-visible
-  /// `join(...)` calls inside the rule body and in the runtime `joiner`
-  /// adapter that merges partial results.
+  /// Common `Op` types for `apply_rule`.
 
-  /// @brief Marker operator for `apply_rule`s that do not expect a runtime
-  ///   join step.
-  ///
-  /// `NullOp` is commonly used when the useful work happens in the rule body
-  /// or prelude. If the runtime reduction machinery attempts to invoke the
-  /// join operator, this implementation reports that unexpected call.
+  /// `Op` type for `apply_rule`s whose join operation should not be called.
+  /// Reports an error if invoked.
   template <class T> struct NullOp {
     void operator()(T &res, const T &arg) {
       std::cerr << "join should not be called for NullOp" << std::endl ;
@@ -859,8 +739,8 @@ namespace Loci {
     }
   } ;
 
-  /// @brief Reduction operator that adds each contribution into the
-  ///   accumulated result.
+  /// Reduction operator that adds each contribution into the
+  /// accumulated result.
   template <class T> struct Summation {
     void operator()(T &res, const T &arg) {
       res += arg ;
@@ -870,8 +750,8 @@ namespace Loci {
     }
   } ;
 
-  /// @brief Reduction operator that multiplies each contribution into the
-  ///   accumulated result.
+  /// Reduction operator that multiplies each contribution into the
+  /// accumulated result.
   template <class T> struct Product {
     void operator()(T &res, const T &arg) {
       res *= arg ;
@@ -881,8 +761,8 @@ namespace Loci {
     }
   } ;
 
-  /// @brief Reduction operator that keeps the maximum contribution seen so
-  ///   far.
+  /// Reduction operator that keeps the maximum contribution seen so
+  /// far.
   template <class T> struct Maximum {
     void operator()(T &res ,const T &arg) {
       res = max(res,arg) ;
@@ -892,8 +772,8 @@ namespace Loci {
     }
   } ;
 
-  /// @brief `Vect` specialization of `Maximum` that applies the maximum
-  ///   elementwise.
+  /// `Vect` specialization of `Maximum` that applies the maximum
+  ///  elementwise.
   template <class T> struct Maximum<Vect<T> > {
     template <class U> void operator()(Vect<T> &res ,const U &arg) {
       int vs = res.getSize() ;
@@ -903,8 +783,8 @@ namespace Loci {
     }
   } ;
 
-  /// @brief Reduction operator that keeps the minimum contribution seen so
-  ///   far.
+  /// Reduction operator that keeps the minimum contribution seen so
+  /// far.
   template <class T> struct Minimum {
     void operator()(T &res, const T &arg) {
       res = min(res,arg) ;
@@ -914,8 +794,8 @@ namespace Loci {
     }
   } ;
 
-  /// @brief `Vect` specialization of `Minimum` that applies the minimum
-  ///   elementwise.
+  /// `Vect` specialization of `Minimum` that applies the minimum
+  ///  elementwise.
   template <class T> struct Minimum<Vect<T> > {
     template <class U> void operator()(Vect<T> &res ,const U &arg) {
       int vs = res.getSize() ;
@@ -944,8 +824,8 @@ namespace Loci {
       std::string internal_qualifier ;
       std::string impl_name ;
       const std::string &name() const { return rule_ident ; }
-      const std::string &rule_identifier() const { return rule_ident ;}
-      info() { rule_ident = "NO_RULE" ;}
+      const std::string &rule_identifier() const { return rule_ident ; }
+      info() { rule_ident = "NO_RULE" ; }
       info(const rule_implP &fp) ;
       info(const info &fi, time_ident tl) ;
       // prepend time_ident to info
@@ -1091,17 +971,6 @@ namespace Loci {
   /// Time prepend to a rule
   rule prepend_rule(const rule& r, const time_ident& t) ;
 
-  /// @brief Typed set of `rule` handles backed by `intervalSet`.
-  ///
-  /// `ruleSet` reuses the interval-based set algebra provided by
-  /// `intervalSet`, but exposes membership tests and iteration in terms of
-  /// `rule` objects rather than raw integer identifiers. This makes it the
-  /// common set type for rule collections throughout the rule database,
-  /// dependency-graph, and scheduling code.
-  ///
-  /// Because rule identifiers occupy the negative side of the shared graph
-  /// vertex space, helpers such as `extract_rules()` can also construct a
-  /// `ruleSet` directly from graph-derived `intervalSet`s.
   class ruleSet : public intervalSet {
   public:
     ruleSet() {}
